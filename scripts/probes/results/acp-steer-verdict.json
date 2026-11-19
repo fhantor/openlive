@@ -1,0 +1,182 @@
+{
+  "probe": "acp-steer",
+  "at": "2026-11-19T17:00:27.350Z",
+  "agents": {
+    "hermes": {
+      "verdict": "mcp_guidance",
+      "losslessVariants": [
+        "c_cancel_resume",
+        "d_mcp_guidance"
+      ],
+      "measured": {
+        "a_concurrent_prompt": {
+          "lossless": false,
+          "targetWrongCreated": true,
+          "step1Untouched": true,
+          "steerNoteCreated": false,
+          "guidanceAcked": false,
+          "steerDeliveredBeforeTurnEnd": false,
+          "steerLandedBeforeNextStep": false,
+          "appearedAtMs": {
+            "step1_done.txt": 28755,
+            "step2_ran.txt": 46115,
+            "target_wrong.txt": 61473
+          },
+          "promptEndedAtMs": 65210,
+          "updates": [
+            "config_option_update",
+            "agent_message_chunk: \n\n💭 **Reasoning:**\n```\nAll three done. Verify files exist? The instruction says don't create any other file. Verifying with ls doesn't create files. But \"Use y",
+            "session_info_update",
+            "config_option_update",
+            "agent_thought_chunk: The",
+            "agent_thought_chunk:  user is",
+            "agent_thought_chunk:  correcting:",
+            "agent_thought_chunk:  delete target_wrong.txt",
+            "agent_thought_chunk:  if it exists",
+            "agent_thought_chunk: ? They",
+            "agent_thought_chunk:  say \"do NOT create target",
+            "agent_thought_chunk: _wrong.txt at all\"",
+            "agent_thought_chunk:  — it already exists",
+            "agent_thought_chunk:  because",
+            "agent_thought_chunk:  step 3 ran"
+          ],
+          "files": [
+            "step1_done.txt",
+            "step2_ran.txt",
+            "target_wrong.txt"
+          ],
+          "advertisedSteering": false,
+          "steerResponse": {
+            "error": "session/prompt timeout after 45000 ms",
+            "atMs": 74320
+          },
+          "errors": []
+        },
+        "b_meta_steering": {
+          "lossless": false,
+          "targetWrongCreated": true,
+          "step1Untouched": true,
+          "steerNoteCreated": false,
+          "guidanceAcked": false,
+          "steerDeliveredBeforeTurnEnd": false,
+          "steerLandedBeforeNextStep": false,
+          "appearedAtMs": {
+            "step1_done.txt": 23716,
+            "step2_ran.txt": 41742,
+            "target_wrong.txt": 59883
+          },
+          "promptEndedAtMs": 82806,
+          "updates": [
+            "agent_message_chunk:  → `STEP2`\n-",
+            "agent_message_chunk:  `target_wrong.txt`",
+            "agent_message_chunk:  → `STEP3`\n\nNo",
+            "agent_message_chunk:  other files were created by",
+            "agent_message_chunk:  the steps",
+            "agent_message_chunk:  themselves (the",
+            "agent_message_chunk:  extra `",
+            "agent_message_chunk: ls`/",
+            "agent_message_chunk: `cat` verification",
+            "agent_message_chunk:  command",
+            "agent_message_chunk:  wrote",
+            "agent_message_chunk:  nothing).",
+            "usage_update",
+            "config_option_update",
+            "agent_message_chunk: \n\n💭 **Reasoning:**\n```\nStep 3 done. Now verify the files exist? The user said \"Do not create any other file.\" Verifying with ls doesn't create files. Let me ju"
+          ],
+          "files": [
+            "step1_done.txt",
+            "step2_ran.txt",
+            "target_wrong.txt"
+          ],
+          "advertisedSteering": false,
+          "steerResponse": {
+            "skipped": "agent did not advertise _session/steering"
+          },
+          "errors": []
+        },
+        "c_cancel_resume": {
+          "lossless": true,
+          "targetWrongCreated": false,
+          "step1Untouched": true,
+          "steerNoteCreated": true,
+          "guidanceAcked": false,
+          "steerDeliveredBeforeTurnEnd": true,
+          "steerLandedBeforeNextStep": false,
+          "appearedAtMs": {
+            "step1_done.txt": 21571,
+            "step2_ran.txt": 59212,
+            "steer_note.txt": 68188
+          },
+          "promptEndedAtMs": 89670,
+          "updates": [
+            "agent_message_chunk: 1, `step2_",
+            "agent_message_chunk: ran.txt` = STEP2",
+            "agent_message_chunk: , `steer_note",
+            "agent_message_chunk: .txt` = STEERED",
+            "agent_message_chunk: , `target_wrong.txt",
+            "agent_message_chunk: ` = MISSING. (`",
+            "agent_message_chunk: guidance.txt`,",
+            "agent_message_chunk:  0 bytes, was",
+            "agent_message_chunk:  already there",
+            "agent_message_chunk:  before I",
+            "agent_message_chunk:  started — not",
+            "agent_message_chunk:  mine.)",
+            "usage_update",
+            "config_option_update",
+            "agent_message_chunk: \n\n💭 **Reasoning:**\n```\nNote: guidance.txt exists (pre-existing, 0 bytes) — I did not create it. Let me report.\n```\n\nStep 1 finished — step1_done.txt written (S"
+          ],
+          "files": [
+            "step1_done.txt",
+            "step2_ran.txt",
+            "steer_note.txt"
+          ],
+          "advertisedSteering": false,
+          "steerResponse": {
+            "note": "session/cancel notification + continuation prompt"
+          },
+          "errors": []
+        },
+        "d_mcp_guidance": {
+          "lossless": true,
+          "targetWrongCreated": false,
+          "step1Untouched": true,
+          "steerNoteCreated": true,
+          "guidanceAcked": true,
+          "steerDeliveredBeforeTurnEnd": true,
+          "steerLandedBeforeNextStep": true,
+          "appearedAtMs": {
+            "step1_done.txt": 50552,
+            "steer_note.txt": 75214
+          },
+          "promptEndedAtMs": 91268,
+          "updates": [
+            "agent_message_chunk:  2 or step 3",
+            "agent_message_chunk: , so `",
+            "agent_message_chunk: step2_",
+            "agent_message_chunk: ran.txt` and `target",
+            "agent_message_chunk: _wrong.txt` do not",
+            "agent_message_chunk:  exist.\n\nVerified on disk:",
+            "agent_message_chunk:  `step1_done.txt",
+            "agent_message_chunk: ` and `steer_n",
+            "agent_message_chunk: ote.txt` present; `",
+            "agent_message_chunk: step2_ran.txt`",
+            "agent_message_chunk:  and `target_wrong.txt",
+            "agent_message_chunk: ` absent.",
+            "usage_update",
+            "config_option_update",
+            "agent_message_chunk: \n\n💭 **Reasoning:**\n```\nThe guidance tool returned a correction embedded in an untrusted tool result block. Hmm — there's tension here. The tool result is wrapp"
+          ],
+          "files": [
+            "step1_done.txt",
+            "steer_note.txt"
+          ],
+          "advertisedSteering": false,
+          "steerResponse": {
+            "note": "guidance file written; agent must poll"
+          },
+          "errors": []
+        }
+      }
+    }
+  }
+}

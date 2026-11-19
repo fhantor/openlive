@@ -1,0 +1,40 @@
+{
+  "probe": "gemini-bidi",
+  "model": "models/gemini-3.8-live",
+  "at": "2026-11-19T17:00:10.976Z",
+  "initialHistorySilent": true,
+  "midTurnFalseSilent": true,
+  "resumePreservedContext": true,
+  "bengaliTranscriptOk": true,
+  "details": {
+    "initialHistory": {
+      "initialHistorySilent": true,
+      "recalled": true,
+      "seedFrames": 1,
+      "transcript": "AZURE-FALCON-94",
+      "closed": null
+    },
+    "midTurnFalse": {
+      "midTurnFalseSilent": true,
+      "recalled": true,
+      "transcript": "MANGO-77",
+      "closed": null
+    },
+    "sessionResumption": {
+      "resumePreservedContext": true,
+      "handleIssued": true,
+      "tokensBefore": 567,
+      "tokensAfter": 702,
+      "transcript": "RIVER-31",
+      "closed": null
+    },
+    "bengali": {
+      "bengaliTranscriptOk": true,
+      "audioSource": "tts:gemini-3.8-flash-tts@24000Hz",
+      "inputTranscript": "শোনো, আমার অ্যাপের হেডার টাইটেলটা বদলে ওপেন লাইভ প্রো করো।",
+      "outputTranscript": "ঠিক আছে, আপনার অ্যাপের হেডার টাইটেলটি বদলে 'Open Live Pro' করা হলো।",
+      "outputIsBengali": true,
+      "closed": null
+    }
+  }
+}
