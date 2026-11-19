@@ -16,6 +16,23 @@ export function pcmDecoder(): (bytes: Uint8Array) => Float32Array {
   };
 }
 
+/** Decodes little-endian **PCM16** bytes (mono: /realtime's frames, Gemini's
+ *  24 kHz output) to Float32 samples in [-1, 1). NOT pcmDecoder(): that one reads
+ *  Float32LE, and feeding PCM16 through it is static that sounds like a transport
+ *  bug. One scale for both signs (/32768, as `readInt16LE(...) / 32768` elsewhere
+ *  in this repo) so a sample survives a decode→encode round trip exactly. */
+export function pcm16ToFloat32(bytes: Uint8Array): Float32Array {
+  // An odd trailing byte is a frame cut in half: it cannot be read, so it is
+  // dropped rather than misread as the low byte of the next sample.
+  const whole = bytes.length - (bytes.length % 2);
+  const out = new Float32Array(whole / 2);
+  for (let i = 0, o = 0; i < whole; i += 2, o++) {
+    const s = (bytes[i]! | (bytes[i + 1]! << 8)) << 16 >> 16; // sign-extend 16 bits
+    out[o] = s / 0x8000;
+  }
+  return out;
+}
+
 /** The last `size` mic frames, so speech the VAD only recognised a few frames in
  *  can still be sent from its true start. push is O(1); drain is O(samples held). */
 export class FrameRing {

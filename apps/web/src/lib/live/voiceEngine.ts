@@ -2,7 +2,13 @@ import { MicVAD } from "@ricky0123/vad-web";
 import { AudioPlayer } from "./audioPlayback";
 import { stt, tts, timedOn, type Heard, ttsStream, hasWebGPU, turnComplete, turnModelReady, activeSttEngine, nativeSttFailed, resetNativeFallbacks, warmNativeEngines } from "./models";
 import { isJunk, isBackchannel, endsMidThought, stripMarkdown, speechPieces, estimateSpeechMs, SentenceChunker, LISTENING, asksQuestion, joinChunks } from "./voiceText";
+import type { EnginePhase, HoldEnd, TurnTuning, VoiceEngine as VoiceEngineContract, VoiceEngineHandlers } from "./engineTypes";
+import { MicSpectrum, MIN_UTTER_SAMPLES, NoiseFloor, PRE_SPEECH_FRAMES, RMS_GATE, rmsOf, tapeOf, watchMicEnded, type Tape } from "./micCapture";
 import { octaveBands } from "./spectrum";
+// The phase + handler contract moved to engineTypes.ts so the native engine can
+// implement the same one; re-exported here because imports that predate the seam
+// (`@/lib/live/voiceEngine`) still name them.
+export type { EnginePhase, HoldEnd, TurnTuning, VoiceEngineHandlers } from "./engineTypes";
 import { cueTone, type HoldCue } from "./holdCue";
 import { holdVerdict, micWaitMs } from "./holdLive";
 import { perf } from "./perf";
@@ -28,68 +34,13 @@ import { speechStats, type Feats } from "@openlive/shared/speech/addressee";
 // holds through natural pauses; the final text goes to the server; the LLM's
 // reply text streams back and is spoken by the selected TTS engine, chunk by
 // chunk when it streams. Barge-in is a LOCAL decision, no server round-trip for audio.
-export type EnginePhase = "idle" | "listening" | "thinking" | "speaking";
-
-export interface VoiceEngineHandlers {
-  onPhase: (p: EnginePhase) => void;
-  onPartial: (text: string) => void;      // interim user caption (greyed)
-  onUserText: (text: string, wordsAtMs: number[], speaker?: string, judged?: string, aside?: boolean) => void; // final user turn → send to server: each captionWords word's onset, ms into the turn's audio (its segments back to back); `speaker` "you" or "other N" when the voiceprint is on; `judged` its side talk judgment's id in the agent's log, when that is on; `aside` it was taken for side talk and sent on by hand
-
-  onAgentText: (sentence: string, wordsAtMs: number[]) => void; // agent caption chunk, now voicing: each captionWords word's onset from now
-  onAgentTiming?: (wordsAtMs: number[]) => void; // the chunk on screen, timed again once more of its audio is in
-  onBargeIn: (spoken?: string) => void;     // cancel the LLM stream; `spoken` = what was actually voiced so far, undefined before this reply arrived
-  // A mid-thought pause is being held: `until` = when it auto-sends (UI shows a
-  // "waiting for you… tap to send" affordance); null = hold resolved/cancelled.
-  onHold: (h: { until: number } | null) => void;
-  /** True while user speech must NOT barge in — e.g. a permission ask is pending
-   *  and the next utterance IS the answer. Cancelling there killed the very ask
-   *  the user was answering (the chip vanished the moment they spoke). */
-  holdBargeIn?: () => boolean;
-  /** True when `text` settles the pending ask ("yes", "no"): its turn ends at
-   *  once, since the turn model calls a bare "Yes." unfinished and would hold it. */
-  answersAsk?: (text: string) => boolean;
-  /** The mic track ended on its own: unplugged, or its permission revoked. The
-   *  surface re-acquires a device and hands it to setStream. */
-  onMicLost?: () => void;
-  /** A finished sentence the side talk check took for talk to someone else:
-   *  dropped, not sent. The surface can show it, and send it on a tap
-   *  (sendAside). `judged`: as onUserText's. */
-  onSideTalk?: (text: string, speaker?: string, judged?: string) => void;
-  /** The user started talking: a segment that is not the agent's own echo. */
-  onSpeechStart?: () => void;
-  /** A push-to-talk hold's first frame with sound in it: the device is awake, words from here are heard. */
-  onHoldLive?: () => void;
-  /** A hold's microphone opened and still gave no sound once its device's wait was up (holdVerdict). */
-  onHoldSilent?: () => void;
-}
-
-/** How a push-to-talk hold ended: its words sent on, none heard, or heard and not written down. */
-export type HoldEnd = "heard" | "silent" | "lost";
-
-/**
- * Turn-taking numbers for a surface that needs different ones from the user's
- * saved pipeline.
- *
- * Flow is the case this exists for: in a call the person can see the caption
- * and press a key, and being cut off early costs them a click. Hands-free there
- * is no key and no screen, so a sentence cut in half is sent, answered and
- * acted on before they can say the rest of it.
- */
-export interface TurnTuning { threshold?: number; holdMs?: number; redemptionMs?: number; backchannels?: boolean }
+//
+// The renderer seam (EnginePhase, VoiceEngineHandlers, TurnTuning, HoldEnd) lives
+// in engineTypes.ts; the microphone plumbing (device, 16 kHz framing, track-ended
+// recovery, the room's noise floor) in micCapture.ts. This class only implements it.
 
 const PARTIAL_MS = 500;      // min gap between interim transcriptions
 const ONSET_GRACE_MS = 250;  // agent's own first syllable can't self-trigger barge-in
-const MIN_UTTER_SAMPLES = 16000 * 0.25; // ignore <0.25s blips
-const RMS_GATE = 0.006;      // reject near-silence; low enough to hear a soft talker
-// vad-web 0.0.31 starts a segment preSpeechPadMs (default 800) before speech was
-// detected, in 512-sample (32 ms) frames: 25 of them plus the frame that tripped it.
-// A streamed utterance sends the same audio from the same point.
-const PRE_SPEECH_FRAMES = Math.floor(800 / 32) + 1;
-// The agent unloads a native engine after 5 idle minutes (native-worker.ts), so
-// a long think or a quiet stretch mid-call would load it cold under the next
-// sentence. A tick well inside that keeps it loaded; warmNativeEngines skips an
-// engine that served a real request in the last minute.
-const KEEP_WARM_MS = 2 * 60_000;
 // Voiced time (Silero frames over the speech threshold) past which a sound over
 // the reply is taken for talk before its words are in. Measured on macOS voices
 // through Silero v6: one backchannel in any of the ten languages voices 256-864 ms
@@ -136,42 +87,11 @@ const voiceNow = (): ReplyVoice => {
 const joinHeard = (a: Heard, aSamples: number, b: Heard): Heard =>
   ({ text: [a.text, b.text.trim()].filter(Boolean).join(" "), at: [...a.at, ...b.at.map((t) => t + (1000 * aSamples) / 16000)] });
 
-function rmsOf(a: Float32Array): number { let s = 0; for (let i = 0; i < a.length; i++) s += a[i]! * a[i]!; return Math.sqrt(s / a.length); }
-
-/** Everything a hold hears, 16 kHz mono, from the moment the microphone opens. */
-type Tape = { stop(lateMs: number): Promise<Float32Array>; peek(): Float32Array };
-/** For a hold that began before the VAD could: loading it takes a moment, and
- *  words said meanwhile would be gone. A ScriptProcessor, not a worklet, since a
- *  worklet's module load is the very wait this covers. */
-function tapeOf(stream: MediaStream): Tape {
-  const ctx = new AudioContext({ sampleRate: 16000 });
-  const node = ctx.createScriptProcessor(1024, 1, 1);
-  const parts: Float32Array[] = [];
-  let total = 0;
-  node.onaudioprocess = (e) => { const p = e.inputBuffer.getChannelData(0).slice(); parts.push(p); total += p.length; };
-  ctx.createMediaStreamSource(stream).connect(node);
-  // A ScriptProcessor runs only on a path to the output. It writes nothing, so nothing plays.
-  node.connect(ctx.destination);
-  void ctx.resume();
-  const all = () => {
-    const out = new Float32Array(total);
-    let off = 0;
-    for (const p of parts) { out.set(p, off); off += p.length; }
-    return out;
-  };
-  return {
-    // Cut at the release, `lateMs` ago, on the context's clock: what came after it is not the hold's.
-    async stop(lateMs) {
-      const end = Math.max(0, Math.round((ctx.currentTime - lateMs / 1000) * 16000));
-      for (let i = 0; i < 6 && total < end; i++) await new Promise((r) => setTimeout(r, 50)); // the last buffer, in flight
-      node.onaudioprocess = null;
-      void ctx.close();
-      return all().subarray(0, end);
-    },
-    /** All of it so far, for a caption while the hold goes on. O(n) in its samples. */
-    peek: all,
-  };
-}
+// The agent unloads a native engine after 5 idle minutes (native-worker.ts), so a
+// long think or a quiet stretch mid-call would load it cold under the next
+// sentence. A tick well inside that keeps it loaded; warmNativeEngines skips an
+// engine that served a real request in the last minute.
+const KEEP_WARM_MS = 2 * 60_000;
 
 export class VoiceEngine {
   private vad: MicVAD | null = null;
@@ -180,7 +100,7 @@ export class VoiceEngine {
   private phase: EnginePhase = "idle";
 
   private pending: Float32Array | null = null;   // held mid-thought utterance
-  private pendingText = "";                        // its transcript, already computed in onSpeechEnd — reused on auto-send instead of re-transcribing
+  private pendingText = "";                        // its transcript, already computed in onSpeechEnd â€” reused on auto-send instead of re-transcribing
   private pendingAt: number[] = [];                // pendingText's word onsets in `pending`
   private holdTimer: ReturnType<typeof setTimeout> | null = null;
   private curBuf: Float32Array[] = [];           // frames since speech start (for partials)
@@ -196,14 +116,14 @@ export class VoiceEngine {
   private holdCues = false;                       // a short tone as a hold turns live and as it ends
   private speakerId = "";
   private tape: Tape | null = null;               // the hold in progress, from the microphone's first frame
-  private muted = false;                          // mirrors setMuted — PTT temporarily lifts a mute, then restores it
+  private muted = false;                          // mirrors setMuted â€” PTT temporarily lifts a mute, then restores it
   private gated = false;                          // push to talk: the VAD runs only while a hold is down (setGate)
   // Set by stop(). A transcription still running then must not start a turn in a
   // call that has already ended.
   private stopped = false;
 
   private micRms = 0;
-  // A dedicated analyser on the mic stream → a real frequency spectrum for the orb
+  // A dedicated analyser on the mic stream â†’ a real frequency spectrum for the orb
   // while YOU talk (the VAD's frames only give amplitude, not per-band energy).
   private specCtx: AudioContext | null = null;
   private micAnalyser: AnalyserNode | null = null;
@@ -242,7 +162,7 @@ export class VoiceEngine {
   private captureReply = 0;  // the debug capture's id for this reply (ttsCapture.ts), and the chunks it has had so far
   private captureChunks = 0;
   // After a barge-in, IGNORE the interrupted reply's late deltas/done (they cross the
-  // wire after the local cancel) until the next user turn re-arms — otherwise a
+  // wire after the local cancel) until the next user turn re-arms â€” otherwise a
   // straggler delta gets the new epoch and is blurted over the user. Re-opened when a
   // new user turn is sent.
   private acceptingReply = true;
@@ -263,7 +183,7 @@ export class VoiceEngine {
   private voicedMs = 0;                            // this segment's voiced time
   private hearing = false;                         // the VAD is inside a segment
   // Audio segments that arrived while the previous one was still finalizing (slow STT
-  // on CPU/WASM) — deferred, not dropped, then re-processed so no speech is lost.
+  // on CPU/WASM) â€” deferred, not dropped, then re-processed so no speech is lost.
   private deferred: { audio: Float32Array; final?: Promise<Heard>; voiced: number; over: boolean }[] = [];
   private asr: AsrStream | null = null;          // open while the active STT engine streams
   private streaming = false;                      // this utterance's frames are going up the socket
@@ -314,7 +234,7 @@ export class VoiceEngine {
   private onMicEnded = () => { clearTimeout(this.micWaitTimer); this.h.onMicLost?.(); };
 
   // Accept a pre-primed player so audio can be unlocked DURING the Start click
-  // (iOS blocks audio started after an await — see useLiveSession.start).
+  // (iOS blocks audio started after an await â€” see useLiveSession.start).
   constructor(private h: VoiceEngineHandlers, player?: AudioPlayer, private tuning: TurnTuning = {}) {
     this.player = player ?? new AudioPlayer();
     resetNativeFallbacks();
@@ -372,7 +292,7 @@ export class VoiceEngine {
       // vad-web defaults to listening on load, which would unmute a muted mic on a device swap.
       startOnLoad: false,
       // Silero worklet + onnx + ort wasm are vendored into /public/vad by
-      // scripts/copy-voice-assets.mjs (predev/prebuild) — served same-origin,
+      // scripts/copy-voice-assets.mjs (predev/prebuild) â€” served same-origin,
       // no CDN dependency, versions track package.json.
       baseAssetPath: "/vad/",
       onnxWASMBasePath: "/vad/",
@@ -380,12 +300,12 @@ export class VoiceEngine {
       getStream: () => this.acquire(),
       resumeStream: () => this.acquire(),
       pauseStream: async (s) => this.release(s),
-      positiveSpeechThreshold: vadCfg.speechThreshold, // lower → picks up soft speech + faster barge-in
+      positiveSpeechThreshold: vadCfg.speechThreshold, // lower â†’ picks up soft speech + faster barge-in
       negativeSpeechThreshold: Math.max(0.1, vadCfg.speechThreshold - 0.15),
       minSpeechMs: 250,
       // Wait through short natural pauses before ending a turn. Kept modest because
       // Smart-Turn v3 (semantic end-of-turn) + the mid-thought hold below already
-      // catch premature ends — so we don't need a long silence buffer, and shaving it
+      // catch premature ends â€” so we don't need a long silence buffer, and shaving it
       // takes real latency off every turn. ponytail: raise toward 700 if it starts
       // cutting slow talkers off mid-sentence.
       redemptionMs: vadCfg.redemptionMs,
@@ -500,8 +420,8 @@ export class VoiceEngine {
       a.fftSize = 256;
       a.smoothingTimeConstant = 0.6;
       this.micSrc = ctx.createMediaStreamSource(stream);
-      // analyser → muted gain → destination: some engines only process an analyser
-      // that's in a path to the destination. Gain 0 → silent (no echo).
+      // analyser â†’ muted gain â†’ destination: some engines only process an analyser
+      // that's in a path to the destination. Gain 0 â†’ silent (no echo).
       const mute = ctx.createGain();
       mute.gain.value = 0;
       this.micSrc.connect(a);
@@ -527,7 +447,7 @@ export class VoiceEngine {
     await this.start(this.open!);
   }
 
-  // ── user speech ─────────────────────────────────────────────────────────
+  // â”€â”€ user speech â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   private onSpeechStart() {
     this.segment++;
     this.voicedMs = 0;
@@ -538,7 +458,7 @@ export class VoiceEngine {
     // The segment opens with the frames before Silero fired, a soft voice's first
     // words among them: the floor they taught while idle is not the room's.
     this.noiseFloor = this.floors[this.floorAt]!;
-    // Barge-in: the user talks over the agent — whether it's SPEAKING, or still
+    // Barge-in: the user talks over the agent â€” whether it's SPEAKING, or still
     // THINKING/working (e.g. a coding agent running tools or editing). Cancel the
     // in-flight turn AND the agent's execution (the server aborts the turn, which
     // fires ACP session/cancel). The onset grace applies only while speaking, so the
@@ -547,10 +467,10 @@ export class VoiceEngine {
     const thinking = this.phase === "thinking";
     // Playback-aware gate: on SPEAKERS the browser's AEC leaks some of the agent's
     // own voice back into the mic. While agent audio is playing, require the mic's
-    // smoothed RMS to clear the noise gate scaled UP with the playback level —
+    // smoothed RMS to clear the noise gate scaled UP with the playback level â€”
     // real speech over the top clears it, residual echo doesn't. Headphones
     // (agentLevel high but zero acoustic leak) still barge instantly because the
-    // user's voice is the only mic energy. ponytail: linear 2× scale; tune the
+    // user's voice is the only mic energy. ponytail: linear 2Ã— scale; tune the
     // factor if speaker echo still self-triggers on some hardware.
     const echoSafe = !speaking || this.micRms > this.gate() * (1 + 2 * this.player.level());
     const holding = this.h.holdBargeIn?.();
@@ -563,7 +483,7 @@ export class VoiceEngine {
       // Over the user's own sentence still being finalized: as before, cut at once.
       this.bargeIn();
     } else if (holding && echoSafe && speaking) {
-      // A permission/elicitation modal is open and the user is answering it — stop the
+      // A permission/elicitation modal is open and the user is answering it â€” stop the
       // agent's question audio LOCALLY so the mic captures a clean answer (no echo/
       // talk-over), but NEVER send a cancel: barging would kill the very ask being
       // answered (that's why holdBargeIn is set). The utterance still finalizes and
@@ -609,7 +529,7 @@ export class VoiceEngine {
     }
     // Learn the room's ambient noise floor WHILE IDLE (never during the user's own
     // speech), so the reject-gate rises in a loud room / around a TV and stops
-    // background chatter tripping a turn — but stays at the fixed floor in a quiet
+    // background chatter tripping a turn â€” but stays at the fixed floor in a quiet
     // room so a soft talker is still heard. ponytail: a real room needs this
     // calibration; clamp keeps it from ever rising high enough to swallow speech.
     this.floors[this.floorAt] = this.noiseFloor;
@@ -777,12 +697,12 @@ export class VoiceEngine {
     // would make the final wait for it.
     this.partialAbort?.abort();
     // A segment ended while the previous one is still finalizing (STT + turn detection
-    // take real time on CPU/WASM). DON'T drop it — defer and re-process below, or the
+    // take real time on CPU/WASM). DON'T drop it â€” defer and re-process below, or the
     // user's words vanish.
     if (this.finalizing) { this.deferred.push({ audio, final, voiced, over: overReply }); return; }
     let combined = this.pending ? this.concat([this.pending, audio], this.pending.length + audio.length) : audio;
     if (this.tentative && (combined.length < MIN_UTTER_SAMPLES || rmsOf(audio) < this.gate())) { this.resumeReply(); return; }
-    // Reject blips and near-silence up front (ambient noise that tripped the VAD) —
+    // Reject blips and near-silence up front (ambient noise that tripped the VAD) â€”
     // but during push-to-talk a blip must not throw away what's already held.
     if (combined.length < MIN_UTTER_SAMPLES || rmsOf(audio) < this.gate()) { if (!this.ptt) { this.pending = null; this.h.onPartial(""); } if (this.phase === "listening") this.setPhase("idle"); this.settleGate(); return; }
     this.finalizing = true;
@@ -797,7 +717,7 @@ export class VoiceEngine {
       // hello"), so it gets no mid-thought hold; the turn model would only wait it out.
       const barged = this.barged;
       // While push-to-talk is held, no end-of-turn decision at all: just accumulate
-      // and caption — release (endPtt) is the one and only turn boundary.
+      // and caption â€” release (endPtt) is the one and only turn boundary.
       const useTurnModel = !this.ptt && !barged && turnModelReady() && turnCfg.engine !== "silence";
       // The voiceprint on the whole segment, more sure than on its first second:
       // its speaker, and whether it may be a turn at all. Push-to-talk is only labelled.
@@ -869,7 +789,7 @@ export class VoiceEngine {
       // dead air never fire a turn.
       if (isJunk(text)) { this.pending = null; this.h.onPartial(""); this.setPhase("idle"); return; }
       // Hold through a mid-thought pause (model says "not done", or the words
-      // trail off) instead of cutting in — but never longer than the configured
+      // trail off) instead of cutting in â€” but never longer than the configured
       // hold / 20 s.
       const done = barged || !!this.h.answersAsk?.(text) || (modelComplete && !endsMidThought(text, loadPipelineConfig().language));
       if (!done && combined.length < 16000 * 20) {
@@ -902,7 +822,7 @@ export class VoiceEngine {
       this.h.onUserText(text, heard.at, speaker, judged);
     } catch {
       // A stalled/failed inference (now time-limited in models.call) must not strand
-      // the turn loop — recover to idle and clear the frozen partial caption.
+      // the turn loop â€” recover to idle and clear the frozen partial caption.
       if (this.stopped) return;
       if (this.tentative) this.bargeIn(); // words unknown over a paused reply: talk always stops the agent
       this.pending = null; this.h.onPartial(""); this.setPhase("idle");
@@ -946,14 +866,14 @@ export class VoiceEngine {
       if (this.stopped) return;
       const text = h.text.trim();
       if (text && !isJunk(text)) { this.cutPlayingReply(); this.setPhase("thinking"); this.spokenText = ""; this.voicing = null; this.replyFed = false; this.replyVoice = null; this.acceptingReply = true; this.replyOpen = true; this.turnSentAt = performance.now(); perf.turnCommitted(0); this.h.onUserText(text, h.at, speaker, judged); }
-      else this.h.onPartial(""); // held fragment came back empty/junk → clear the caption
+      else this.h.onPartial(""); // held fragment came back empty/junk â†’ clear the caption
     };
     // The held audio was already transcribed in onSpeechEnd (that's how we knew it
-    // was mid-thought), so reuse that transcript instead of re-running STT here —
+    // was mid-thought), so reuse that transcript instead of re-running STT here â€”
     // the auto-send path was paying for a second transcription. Fall back to STT
     // only if for some reason we don't have the cached text.
     if (cached.text) commit(cached);
-    else void stt(p).then(commit).catch(() => this.h.onPartial("")); // stalled/failed STT → don't strand the caption
+    else void stt(p).then(commit).catch(() => this.h.onPartial("")); // stalled/failed STT â†’ don't strand the caption
   }
   /** A sentence the side talk check dropped, sent on the user's tap: a turn
    *  like a spoken one, cutting a reply under way, and its logged judgment
@@ -985,7 +905,7 @@ export class VoiceEngine {
   }
   private clearHold() { if (this.holdTimer) { clearTimeout(this.holdTimer); this.holdTimer = null; this.h.onHold(null); } }
 
-  // ── push-to-talk ────────────────────────────────────────────────────────
+  // â”€â”€ push-to-talk â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   /** Hold-to-talk pressed: barge in if the agent is mid-reply, open the microphone
    *  if a mute or the gate has it shut (shut again on release), tape the hold from
    *  its first frame, and suspend all auto end-of-turn: release is the turn boundary. */
@@ -1132,9 +1052,9 @@ export class VoiceEngine {
     }
   }
 
-  // ── agent reply → speech ───────────────────────────────────────────────
+  // â”€â”€ agent reply â†’ speech â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   feedAgentDelta(text: string) {
-    if (!this.acceptingReply) return; // interrupted reply's straggler deltas — don't voice them
+    if (!this.acceptingReply) return; // interrupted reply's straggler deltas â€” don't voice them
     this.replyFed = true;
     this.replyOpen = true;
     perf.firstToken(); // no-op after the first delta of a turn
@@ -1179,7 +1099,7 @@ export class VoiceEngine {
     this.openingDue = true;
   }
   endAgentTurn() {
-    if (!this.acceptingReply) return; // the barged reply's `done` — no tail to flush/voice
+    if (!this.acceptingReply) return; // the barged reply's `done` â€” no tail to flush/voice
     const tail = this.chunker.flush();
     if (tail) this.enqueueSpeak(tail, this.epoch, this.replyVoice ?? voiceNow());
     this.waiting = null; // the next reply's first line never joins this one's last
@@ -1219,7 +1139,7 @@ export class VoiceEngine {
     if (!outOfBand) this.openingDue = false;
     this.ttsChain = this.ttsChain.then(async () => {
       if (this.waiting === job) this.waiting = null;
-      if (this.epoch !== epoch) return; // barged-in → drop stale speech
+      if (this.epoch !== epoch) return; // barged-in â†’ drop stale speech
       // The caption shows `spoken`, as the model wrote it; the voice says `said`.
       const spoken = stripMarkdown(job.text);
       if (!spoken) return;
@@ -1309,7 +1229,7 @@ export class VoiceEngine {
   }
 
   /** Speak a short out-of-band line (e.g. an agent failure) through the same
-   *  TTS chain — voice-first users hear problems, not just see banners. */
+   *  TTS chain â€” voice-first users hear problems, not just see banners. */
   say(text: string) {
     const t = text.trim();
     if (!t) return;
@@ -1424,7 +1344,7 @@ export class VoiceEngine {
     return (v.before ? `${v.before} ${heard}` : heard).trim();
   }
 
-  // ── helpers / lifecycle ────────────────────────────────────────────────
+  // â”€â”€ helpers / lifecycle â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   private concat(parts: Float32Array[], total: number): Float32Array {
     const out = new Float32Array(total); let off = 0;
     for (const p of parts) { out.set(p, off); off += p.length; }
@@ -1464,7 +1384,7 @@ export class VoiceEngine {
   micLevel() { return this.micRms; }
   agentLevel() { return this.player.level(); }
   setSpeaker(id: string) { this.speakerId = id; this.player.setSink(id); this.cuePlayer?.setSink(id); }
-  /** N octave-band magnitudes (0..1) of YOUR voice — a real spectrum for the orb. */
+  /** N octave-band magnitudes (0..1) of YOUR voice â€” a real spectrum for the orb. */
   micBands(n = 5): number[] {
     if (!this.micAnalyser || !this.micFreq) return new Array(n).fill(0);
     this.micAnalyser.getByteFrequencyData(this.micFreq as Uint8Array<ArrayBuffer>);
