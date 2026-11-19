@@ -18,6 +18,7 @@ import { Lobby } from "./Lobby";
 import { InCall } from "./InCall";
 import { PermissionPrompt } from "./AgentControls";
 import { ElicitationPrompt } from "./ElicitationPrompt";
+import { DraftCard } from "./DraftCard";
 import { openliveBridge, setPanelCmdHandler } from "@/lib/live/panelBridge";
 import { useHydrated } from "@/lib/useHydrated";
 
@@ -25,7 +26,7 @@ import { useHydrated } from "@/lib/useHydrated";
 // model pick, devices, model download) then the full-screen in-call view — both
 // share the same TopBar + main + sidebar skeleton so the switch feels continuous.
 export function LiveDock({ chatId, onExit }: { chatId: string; onExit: () => void }) {
-  const { start, stop, prewarm, download, toggleMute, toggleCamera, toggleScreen, getLevels, getBands, refreshDevices, setMic, setCam, answerPermission, sendNow, sendAside, notForYou, pttDown, pttUp, pttCancel } = useLiveSession(chatId);
+  const { start, stop, prewarm, download, toggleMute, toggleCamera, toggleScreen, getLevels, getBands, refreshDevices, setMic, setCam, answerPermission, sendNow, sendAside, notForYou, pttDown, pttUp, pttCancel, draft, sendDraftAction } = useLiveSession(chatId);
   // Narrow selector: this component must NOT subscribe to the hot per-chunk
   // fields (captions, toolStatus, todos, usage, terminals) — InCall and
   // TranscriptPanel own those. Whole-store destructuring made the entire call
@@ -114,6 +115,9 @@ export function LiveDock({ chatId, onExit }: { chatId: string; onExit: () => voi
       )}
       {active && <PermissionPrompt answerPermission={answerPermission} />}
       {active && <ElicitationPrompt />}
+      {/* Key 3 of the confirmation gate: the draft /realtime is holding, with Send
+          locked until the spoken key has validated it. Nothing in a cascade call. */}
+      {active && <DraftCard draft={draft} onAction={sendDraftAction} />}
     </>
   );
 }

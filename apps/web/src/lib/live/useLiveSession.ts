@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { chatStore } from "@/lib/chatStore";
 import { api } from "@/lib/api";
 import { toast } from "@/lib/toast";
@@ -11,6 +11,10 @@ import { CameraCapture } from "./cameraCapture";
 import { AudioPlayer } from "./audioPlayback";
 import { deviceOptions } from "./devices";
 import { VoiceEngine, type EnginePhase } from "./voiceEngine";
+import type { VoiceEngine as VoiceEngineContract, VoiceEngineHandlers } from "./engineTypes";
+import { RealtimeEngine } from "./realtimeEngine";
+import { loadPipelineConfig } from "./pipelineConfig";
+import type { ActiveDraftView, RealtimeClientMsg } from "@openlive/shared";
 import { labelJudgment } from "./addressee";
 import { loadModels, modelsCachedSettled, modelsMatchConfig } from "./models";
 import { kindMeta, toolActive } from "./toolMeta";
@@ -146,7 +150,20 @@ export function useLiveSession(chatId: string) {
   const boundAgent = useLiveStore((s) => s.boundAgent);
   const boundCwd = useLiveStore((s) => s.boundCwd);
   const client = useRef<LiveClient | null>(null);
-  const engine = useRef<VoiceEngine | null>(null);
+  // Whichever engine the settings chose (docs/00-BUILD-ORDER Stage 8): the
+  // on-device cascade, or Gemini Live's native audio. Both satisfy the same
+  // VoiceEngine contract (engineTypes.ts), so nothing below learns which one it
+  // holds. `engineMode` is read at Start, so a switch applies to the next call.
+  const engine = useRef<VoiceEngineContract | null>(null);
+  // The native engine's own /realtime socket, kept so a DraftCard action rides the
+  // same session (one socket per chat). Only the native engine opens one.
+  const nativeSocket = useRef<WebSocket | null>(null);
+  // Whether this call runs the native engine — read at Start, and only then.
+  const nativeMode = useRef(false);
+  // The one draft /realtime is holding (docs/01-CONTRACTS.md rule 3: one per chat).
+  // Cascade calls never have one, so the card renders nothing there.
+  const [draft, setDraft] = useState<ActiveDraftView | null>(null);
+
   const player = useRef<AudioPlayer | null>(null);
   const camRef = useRef<CameraCapture | null>(null);
   const screenRef = useRef<CameraCapture | null>(null);
@@ -259,6 +276,10 @@ export function useLiveSession(chatId: string) {
     // The on-device voice worker is left running on purpose — kept warm for the
     // tab's lifetime so reopening Live is instant (no re-download / shader recompile).
     client.current = null; engine.current = null; camRef.current = null; screenRef.current = null;
+    // The draft belonged to the native session that just ended; a cascade call has none.
+    nativeSocket.current = null;
+    nativeMode.current = false;
+    setDraft(null);
     // Keep `error` so the user sees why it ended; start() clears it next time.
     set({ active: false, phase: "off", downloading: false, downloadPct: 0, cameraOn: false, screenOn: false, muted: false, pttActive: false, cameraStream: null, screenStream: null, userCaption: "", userPartial: false, agentCaption: "", toolStatus: "", warming: false, permission: null, agentMeta: null, agentConnecting: false, todos: [], usage: null, terminals: {}, elicitation: null, typedQueue: [] });
   }, [chatId, set]);
@@ -506,6 +527,9 @@ export function useLiveSession(chatId: string) {
   // models/modes into the lobby BEFORE the call starts. No-op for the built-in
   // assistant (its models come from the provider API) or if already connected.
   const prewarm = useCallback(() => {
+    // A native call binds its own agent over /realtime at Start; warming a /live
+    // session here would be a second agent process on the same project.
+    if (loadPipelineConfig().engine === "realtime") return;
     const st = useLiveStore.getState();
     if (!st.boundAgent || !st.boundCwd || client.current) return;
     tornDown.current = false;
@@ -532,8 +556,10 @@ export function useLiveSession(chatId: string) {
     try {
       // 1. Models (download-on-demand, cached). Shows a progress bar the first time,
       //    and reloads if the pipeline config changed (e.g. a new Whisper size) so the
-      //    warm worker doesn't keep serving the old weights.
-      if (!modelsMatchConfig()) { set({ phase: "loading" }); await loadModels((p) => set({ downloadPct: p.pct, downloadLoaded: p.loaded, downloadTotal: p.total, downloadModels: p.models })); }
+      //    warm worker doesn't keep serving the old weights. A native-audio call runs
+      //    no on-device weights: Gemini hears and speaks on the server, so skip them.
+      const native = loadPipelineConfig().engine === "realtime";
+      if (!native && !modelsMatchConfig()) { set({ phase: "loading" }); await loadModels((p) => set({ downloadPct: p.pct, downloadLoaded: p.loaded, downloadTotal: p.total, downloadModels: p.models })); }
       if (tornDown.current) return;
 
       // 2. Mic: the device chosen when the engine opens it (for the call
@@ -546,8 +572,11 @@ export function useLiveSession(chatId: string) {
         return navigator.mediaDevices.getUserMedia({ audio });
       };
 
-      // 3. Voice engine.
-      const eng = new VoiceEngine({
+      // 3. Voice engine: the one Settings picked. Both implement the same contract
+      //    (engineTypes.ts), so everything below — phases, mute, push to talk,
+      //    barge-in, levels — learns nothing about which one this is. Read at Start,
+      //    so a switch applies to the next call.
+      const handlers: VoiceEngineHandlers = {
         // Entering "listening" clears the previous answer's caption so the user
         // sees themselves (or "Listening…") the moment they start talking.
         onPhase: (p: EnginePhase) => set(p === "listening" ? { phase: p, agentCaption: "", toolStatus: "" } : { phase: p }),
@@ -626,20 +655,53 @@ export function useLiveSession(chatId: string) {
         answersAsk: (text) => !!useLiveStore.getState().permission && !!classifyYesNo(text),
         // The chosen mic can come back later; the call needs one now.
         onMicLost: () => { fact.current.micLost++; toast(MIC_COPY.switched, "info"); void setMic(""); },
-      }, player.current ?? undefined);
+      };
+      const eng: VoiceEngineContract = native
+        ? new RealtimeEngine(handlers, player.current ?? undefined, {
+          chat: chatId,
+          // Everything /realtime says beside audio. The draft is this stage's; the
+          // asks, tool cards and task status ride the same store from Stage 9 on.
+          onMessage: (m) => {
+            if (m.t === "draft_state") setDraft(m.draft);
+            else if (m.t === "agent_meta") set({ agentMeta: m as unknown as AgentMeta, agentConnecting: false });
+            else if (m.t === "error") set({ error: m.message });
+          },
+          // Keep the socket the engine opens: a DraftCard action has to ride the same
+          // /realtime session the draft was proposed on (one socket per chat).
+          openSocket: (url) => {
+            const ws = new WebSocket(url);
+            nativeSocket.current = ws;
+            // The /realtime session binds its own ACP host; the /live bind does not
+            // reach it, so hand it this conversation's coding agent and folder.
+            ws.addEventListener("open", () => {
+              const st = useLiveStore.getState();
+              try { ws.send(JSON.stringify({ t: "bind", agentId: st.boundAgent, cwd: st.boundCwd })); } catch { /* closing */ }
+            });
+            return ws;
+          },
+        })
+        : new VoiceEngine(handlers, player.current ?? undefined);
       engine.current = eng;
+      nativeMode.current = native;
       // How you talk is shared with Flow and Dictate: push to talk shuts the gate between holds.
       eng.setGate(useLiveStore.getState().talk.mode === "ptt");
       await eng.start(openMic);
       if (tornDown.current) return;
 
-      // 4. Socket — reuse the pre-call agent connection if the lobby already opened
-      //    it (prewarm), otherwise open it now. The voice engine above drives turns
-      //    over whichever connection; a pre-connected agent means Start is instant.
-      if (!client.current) set({ phase: "connecting" });
-      const c = ensureClient();
+      // 4. Socket. The /live connection is the cascade's text-turn transport; a
+      //    native call already has its one /realtime socket (opened in step 3), and
+      //    opening /live too would put a second agent session on the conversation.
       fact.current.startResult = "ok";
-      if (c.ready) { set({ phase: eng.currentPhase(), warming: false, error: undefined }); markReady(); } // already connected in the lobby
+      if (native) {
+        set({ phase: eng.currentPhase(), warming: false, error: undefined });
+        markReady();
+      } else {
+        // Reuse the pre-call agent connection if the lobby already opened it
+        // (prewarm), otherwise open it now. A pre-connected agent means Start is instant.
+        if (!client.current) set({ phase: "connecting" });
+        const c = ensureClient();
+        if (c.ready) { set({ phase: eng.currentPhase(), warming: false, error: undefined }); markReady(); } // already connected in the lobby
+      }
       await refreshDevices();
     } catch (e: any) {
       const denied = e?.name === "NotAllowedError" || e?.name === "SecurityError";
@@ -746,7 +808,10 @@ export function useLiveSession(chatId: string) {
     if (tornDown.current) return;
     if (typed) fact.current.typedTurns++;
     telemetry.track("onboarding_step", { step: "first_call_turn" });
-    client.current?.userText(text, frames, wordsAt, speaker, aside, !!typed);
+    // The native engine already owns this turn: the server heard the audio itself.
+    // Sending the transcript to /live too would start a second brain on the same
+    // conversation, so only the cascade path pushes the text turn.
+    if (!nativeMode.current) client.current?.userText(text, frames, wordsAt, speaker, aside, !!typed);
     turnStartedAt.current = Date.now();
     set({ userCaption: "", userPartial: false, agentCaption: "" });
     if (assistantId.current) chatStore.liveFinish(chatId, assistantId.current);
@@ -776,6 +841,8 @@ export function useLiveSession(chatId: string) {
   // Explicit, user-initiated model download (pre-call). Nothing downloads until
   // the user agrees in the lobby's offer, and because the worker stays warm, this only happens once.
   const download = useCallback(async () => {
+    // A native call needs no on-device weights; the lobby has nothing to offer it.
+    if (loadPipelineConfig().engine === "realtime") { set({ modelsDownloaded: true }); return; }
     if (modelsMatchConfig()) { set({ modelsDownloaded: true }); return; }
     set({ downloading: true, modelsDownloaded: false, downloadPct: 0, error: undefined });
     try {
@@ -799,6 +866,9 @@ export function useLiveSession(chatId: string) {
         cams: deviceOptions(devs, "videoinput"),
       });
     } catch { /* enumerate not available */ }
+    // A native call runs no on-device weights: nothing to download, nothing to warm,
+    // and the lobby must not wait on a cascade model before it can start.
+    if (loadPipelineConfig().engine === "realtime") { set({ modelsDownloaded: true }); return; }
     const cached = await modelsCachedSettled();
     set({ modelsDownloaded: cached || modelsMatchConfig() });
     if (cached && !modelsMatchConfig() && !useLiveStore.getState().active) void loadModels(() => {}, "launch_warm").catch(() => {});
@@ -962,6 +1032,16 @@ export function useLiveSession(chatId: string) {
   // A tap or a key on top: the hold's words go nowhere.
   const pttCancel = useCallback(() => { set({ pttActive: false }); engine.current?.dropPtt(); }, [set]);
 
+  // Key 3 of the confirmation gate (docs/04-REVIEWER-NOTES.md §2): the DraftCard's
+  // Send / Discard / Re-activate. It rides the SAME /realtime socket the draft was
+  // proposed on, and the agent's gate still compares draftId + version in a
+  // synchronous CAS — a stale card can only ever produce a refused action.
+  const sendDraftAction = useCallback((msg: Extract<RealtimeClientMsg, { t: "draft_action" }>) => {
+    const ws = nativeSocket.current;
+    if (ws?.readyState !== 1) return; // 1 = OPEN, as RealtimeEngine's own send checks
+    try { ws.send(JSON.stringify(msg)); } catch { /* closing: the engine's reconnect owns it */ }
+  }, []);
+
   // The talk mode changed mid-call (Settings or the tray): the gate follows at
   // once, and a hold still down as push to talk goes ends as a release, its
   // words kept, since its key is no longer watched.
@@ -971,5 +1051,5 @@ export function useLiveSession(chatId: string) {
     engine.current?.setGate(s.talk.mode === "ptt");
   }), [pttUp]);
 
-  return { start, stop, prewarm, download, toggleMute, toggleCamera, toggleScreen, getLevels, getBands, refreshDevices, setMic, setCam, answerPermission, sendNow, sendAside, notForYou, pttDown, pttUp, pttCancel };
+  return { start, stop, prewarm, download, toggleMute, toggleCamera, toggleScreen, getLevels, getBands, refreshDevices, setMic, setCam, answerPermission, sendNow, sendAside, notForYou, pttDown, pttUp, pttCancel, draft, sendDraftAction };
 }

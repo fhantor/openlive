@@ -12,7 +12,7 @@ import {
   familyVariant, isRestricted, permitted,
 } from "@/lib/live/pipelineConfig";
 import { languageLabel, languagesNote, licenseTag, variantGroups, engineName, switchNotice, missingEngines, slowHere } from "@/lib/live/engineMenu";
-import type { LanguageCode } from "@openlive/shared";
+import type { LanguageCode, VoiceEngineMode } from "@openlive/shared";
 import {
   tts, modelsReady, modelsCached, modelsCachedSettled, loadModels, removeModel, hasWebGPU, resetNativeFallbacks, voiceDownloadPlan,
   listNativeEngines, downloadModel, deleteNativeEngine, type NativeEngineStatus, type NativeFamilyStatus,
@@ -921,6 +921,29 @@ export function LanguagePicker() {
   );
 }
 
+const VOICE_ENGINES: SegOption<VoiceEngineMode>[] = [
+  { id: "cascade", label: "Local cascade" },
+  { id: "realtime", label: "Gemini Live (native audio)" },
+];
+
+/** Which engine hears and answers a call: the on-device cascade, or Gemini Live's
+ *  own ears and voice over the agent. Read at Start, so a change applies next call. */
+function VoiceEngineStage({ cfg, update }: { cfg: PipelineConfig; update: Update }) {
+  const native = cfg.engine === "realtime";
+  return (
+    <div id="set-engine-voice-engine" className="flex flex-col gap-3">
+      <StageHead title="Voice engine" desc="Who hears you, and who speaks, in a call: the on-device cascade, or Gemini Live's native audio." />
+      <Segmented label="Voice engine" anchor="set-engine-voice-engine-mode" className="w-full" wrap
+        options={VOICE_ENGINES} value={cfg.engine} onChange={(engine) => update({ ...cfg, engine })} />
+      <p className="break-words text-caption text-muted-foreground">
+        {native
+          ? `Gemini Live hears and speaks for itself over the agent (${cfg.realtime.model}, voice ${cfg.realtime.voice}). No speech model downloads to this computer, and the speech stages below are not used in a call.`
+          : "Speech-to-text, turn-taking and text-to-speech run on this device: offline after the one-time download."}
+      </p>
+    </div>
+  );
+}
+
 export function PipelineSettings() {
   const [cfg, setCfg] = useState<PipelineConfig>(() => loadPipelineConfig());
   const [stage, setStage] = useState<StageId>("mic");
@@ -951,6 +974,8 @@ export function PipelineSettings() {
 
   return (
     <div className="flex flex-col gap-6">
+      <VoiceEngineStage cfg={cfg} update={update} />
+
       <div id="set-engine-device" className="flex flex-col gap-3">
         <DeviceSummary />
         <Segmented label="Pipeline stage" anchor="set-engine-stage" className="grid w-full"
