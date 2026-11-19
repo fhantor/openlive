@@ -130,17 +130,17 @@ export class LiveSession {
       clipboard: { read: () => this.bridge("clipboard_read"), write: (text) => this.bridge("clipboard_write", text) },
       openUrl: (url) => this.bridge("open_url", url),
       share: { showing: () => (this.screenOn ? "screen" : this.cameraOn ? "camera" : null), frame: () => this.requestFrame() },
-      // Read live, so the file tools track a folder change mid-call.
+      // Read live, so the file tools track a folder change mid-call. `host` is
+      // built further down the constructor, so this must stay a thunk all the
+      // way to first use — dereferencing it here throws on every /live upgrade.
       workspace: () => this.host.cwd,
       emit: (e) => this.toolEmit(e),
       elicit: (req) => this.askElicitation(req),
       ...(device && { device: bridgedDevice((arg) => this.bridge("flow_device", arg, DEVICE_TIMEOUT_MS), async () => (this.cameraOn ? this.requestFrame() : null)) }),
       ...(device && computer.available() && { computer }),
     };
-    this.tools = this.callTools();
     const call = this;
     this.approve = CHAT.approval((question) => call.askPermission(question, ALLOW_OR_DENY).then((id) => id === "allow"));
-    this.runner = new LiveTurnRunner(this.tools, this.toolSession, { approve: this.approve, tally: toolTally("call") });
     // ACP, hosted by its own object: the same code /realtime will use. Everything
     // it needs from the session is a callback, so the two never import each other.
     this.host = new AcpHost({
@@ -166,6 +166,11 @@ export class LiveSession {
       onReady: () => this.send({ t: "sse", event: { type: "status", text: "ready" } }),
       onStartError: (e) => this.reportStartError(e),
     });
+
+    // Tools and the runner last: the skill provider reads `host.cwd`, so `host`
+    // has to exist first, and `runner` takes the resolved set.
+    this.tools = this.callTools();
+    this.runner = new LiveTurnRunner(this.tools, this.toolSession, { approve: this.approve, tally: toolTally("call") });
 
     ws.on("message", (data: Buffer, isBinary: boolean) => {
       if (isBinary) this.onBinary(data);
