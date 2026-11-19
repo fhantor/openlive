@@ -6,7 +6,7 @@
 // the next spoken sentence with no restart; VAD knobs are baked into MicVAD at
 // construction, so they apply on the next session start.
 
-import { LANGUAGE_CODES, type LanguageCode } from "@openlive/shared";
+import { LANGUAGE_CODES, type LanguageCode, type VoiceEngineMode } from "@openlive/shared";
 import type { LexiconEntry } from "@openlive/shared/speech/lexicon";
 import { useVoicePrefs } from "../prefs";
 
@@ -34,6 +34,11 @@ export type Stage = "stt" | "tts";
 export interface StageChoice { family: string; variant: string; variants: Record<string, string> }
 
 export interface PipelineConfig {
+  /** Which voice engine a call runs: the on-device cascade, or the native Gemini Live one. */
+  engine: VoiceEngineMode;
+  /** The native engine's own settings (only read when `engine` is "realtime"):
+   *  the Live model, its prebuilt voice, and how long a silence ends its turn. */
+  realtime: { model: string; voice: string; silenceDurationMs: number };
   language: LanguageCode;                                        // what the user speaks, and what every stage (and the reply) follows
   stt: StageChoice & { whisperSize: WhisperSize };               // STT engine; Whisper's size (applies on reload)
   tts: StageChoice & { voice: string; speed: number };           // TTS engine + voice id ("" = the engine's own pick) + speaking rate
@@ -46,7 +51,15 @@ export interface PipelineConfig {
   allowRestricted: boolean;                                      // the user's OK to pick models under a restricted license (`restricted`)
 }
 
+/** The only native-audio model verified on this key (services/agent/src/live/gemini-bidi.ts). */
+export const GEMINI_LIVE_MODEL = "gemini-3.8-live";
+/** The documented setup message's prebuilt voice. */
+export const GEMINI_LIVE_VOICE = "Aoede";
+export const VOICE_ENGINE_IDS: readonly VoiceEngineMode[] = ["cascade", "realtime"];
+
 export const DEFAULT_PIPELINE_CONFIG: PipelineConfig = {
+  engine: "cascade",
+  realtime: { model: GEMINI_LIVE_MODEL, voice: GEMINI_LIVE_VOICE, silenceDurationMs: 900 },
   language: "en",
   stt: { family: "whisper", variant: "whisper", variants: { whisper: "whisper" }, whisperSize: "base" },
   tts: { family: "kokoro", variant: "kokoro", variants: { kokoro: "kokoro" }, voice: "af_heart", speed: 1 },
@@ -520,12 +533,19 @@ function stageChoice(stage: Stage, raw: Record<string, unknown>, lang: LanguageC
 export function mergePipelineConfig(partial: unknown): PipelineConfig {
   const p = obj(partial);
   const [stt, tts, turn, vad] = [p.stt, p.tts, p.turn, p.vad].map(obj) as [Record<string, unknown>, Record<string, unknown>, Record<string, unknown>, Record<string, unknown>];
+  const rt = obj(p.realtime);
   const d = DEFAULT_PIPELINE_CONFIG;
   const language = oneOf(p.language, LANGUAGE_CODES, d.language);
   const ttsChoice = stageChoice("tts", tts, language);
   const family = familyInfo("tts", ttsChoice.family)!;
   const voice = typeof tts.voice === "string" ? tts.voice : d.tts.voice;
   return {
+    engine: oneOf(p.engine, VOICE_ENGINE_IDS, d.engine),
+    realtime: {
+      model: typeof rt.model === "string" && rt.model.trim() ? rt.model.trim() : d.realtime.model,
+      voice: typeof rt.voice === "string" && rt.voice.trim() ? rt.voice.trim() : d.realtime.voice,
+      silenceDurationMs: clamp(Math.round(num(rt.silenceDurationMs, d.realtime.silenceDurationMs)), 200, 3000),
+    },
     language,
     stt: { ...stageChoice("stt", stt, language), whisperSize: oneOf(stt.whisperSize, WHISPER_SIZE_IDS, d.stt.whisperSize) },
     tts: {
@@ -581,6 +601,33 @@ export function withSurfaceVoice(c: PipelineConfig, own: SurfaceVoice | null | u
     out = mergePipelineConfig({ ...next, tts: { ...next.tts, voice: own.tts.voice } });
   }
   return out;
+}
+
+// ── choosing the voice engine ────────────────────────────────────────────────
+// A native-audio engine model is not a chat model: `gemini-3.8-live` speaks the
+// BidiGenerateContent socket, not /chat/completions. Listed in the cascade's
+// picker it is a trap — picked, every text turn is refused, and the person's only
+// clue is a voice that stopped working. So the cascade's picker hides exactly
+// those; the native engine's picker shows them first. Pure, and both sides of
+// the socket agree on what "live" means.
+
+/** A model id only the native-audio engine can run: `gemini-3.8-live`, and a
+ *  dated one such as `gemini-2.0-flash-live-001`. The agent's rule
+ *  (`isLiveModel` in services/agent/src/live/gemini-bidi.ts) plus a version
+ *  suffix, so the cascade never offers a model the native engine has to take. */
+export const isLiveOnlyModel = (id: string): boolean => /(?:^|\/)gemini-[\w.-]*-live(?:-\d+)?$/i.test(id.trim());
+
+/** The models the CASCADE's picker may list: every chat model, no Live-only ones.
+ *  `idOf` reads the id off a row the picker maps, so one filter serves them all. */
+export function cascadeModels<T>(models: readonly T[], idOf: (m: T) => string = (m) => (m as { id: string }).id): T[] {
+  return models.filter((m) => !isLiveOnlyModel(idOf(m)));
+}
+
+/** The models the NATIVE engine's picker may list: nothing is hidden (its own
+ *  Live model is the one that matters), and a Live model sorts first so the
+ *  engine's model is where a person looks for it. Pure. */
+export function realtimeModels<T>(models: readonly T[], idOf: (m: T) => string = (m) => (m as { id: string }).id): T[] {
+  return [...models].sort((a, b) => Number(isLiveOnlyModel(idOf(b))) - Number(isLiveOnlyModel(idOf(a))));
 }
 
 // Flow and Dictate run in one renderer of their own, which says here whose

@@ -8,6 +8,7 @@ import { allowedEfforts } from "@openlive/harness/types";
 import { useLiveStore } from "@/lib/live/liveStore";
 import { setConversationFolder, setConversationModel, setConversationMode, recentFolders, cachedAgentMeta } from "@/lib/live/useLiveSession";
 import { useApiModeChoice } from "@/lib/live/useApiModeChoice";
+import { cascadeModels } from "@/lib/live/pipelineConfig";
 import { useUi } from "@/lib/uiStore";
 import { api } from "@/lib/api";
 import { toast } from "@/lib/toast";
@@ -143,7 +144,10 @@ export function ApiBar() {
   return (
     <div className={cn("flex min-w-0 items-center gap-1.5", noDrag)}>
       <PillMenu icon={Cpu} title="Model" label={model?.display_name ?? (picked || running || "Recommended")}
-        items={[{ id: "", label: "Recommended" }, ...models.map((m) => ({ id: m.id, label: m.display_name }))]}
+        // Same list, same rule as Settings > Models: the native engine's Live
+        // model speaks another socket, so the cascade's picker must not offer it
+        // (pipelineConfig.ts `cascadeModels`).
+        items={[{ id: "", label: "Recommended" }, ...cascadeModels(models).map((m) => ({ id: m.id, label: m.display_name }))]}
         current={picked} onPick={(id) => save.mutate({ liveModel: id })} footer={next} />
       {efforts.length > 1 && (
         <PillMenu icon={Gauge} title="Effort" label={effortName(effort)} items={efforts.map((e) => ({ id: e, label: effortName(e) }))}

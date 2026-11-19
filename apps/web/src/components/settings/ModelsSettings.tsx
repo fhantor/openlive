@@ -8,6 +8,7 @@ import { BUILTIN_PROVIDERS } from "@openlive/harness/registry";
 import { allowedEfforts } from "@openlive/harness/types";
 import { effortName } from "@/components/live/SetupControls";
 import { modelVision } from "@openlive/shared";
+import { cascadeModels } from "@/lib/live/pipelineConfig";
 import { api, type ModelInfo } from "@/lib/api";
 import { toast } from "@/lib/toast";
 import { ProviderKeyField } from "./ProviderKeyField";
@@ -108,7 +109,10 @@ export function ModelsSettings() {
   const efforts = ["auto", ...allowedEfforts(provider?.protocol, model?.reasoning ?? true)];
   const effort = settings?.liveEffort ?? "auto";
 
-  const options: SearchOption[] = models.map((m) => {
+  // Hidden here, not in the API: gemini-3.8-live is the *native* engine's model
+  // (it speaks BidiGenerateContent, not /chat/completions), so the cascade's
+  // picker must not offer it. pipelineConfig.ts's filter is the one rule, tested.
+  const options: SearchOption[] = cascadeModels(models).map((m) => {
     const bits = [hasVision(providerId, m) && "vision", m.reasoning ? "reasoning" : "fast"].filter(Boolean);
     return { value: m.id, label: m.display_name, hint: bits.join(" · ") };
   });

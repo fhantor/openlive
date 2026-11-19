@@ -7,6 +7,7 @@ import {
   mergePipelineConfig, clampPipelineConfig, PRONUNCIATION_LIMITS, workerTag, tagCached, DEFAULT_PIPELINE_CONFIG, KOKORO_VOICES, SUPERTONIC_VOICES,
   STT_FAMILIES, TTS_FAMILIES, CURATED_LANGUAGES, LANGUAGE_DEFAULTS, languageSupport, pickCompatible, chooseFamily, chooseVariant,
   defaultVariant, nativeFirst, whisperCheckpoint, whisperMaxTokens, browserTtsFallback, familyInfo, variantInfo, isRestricted, loadPipelineConfig, savePipelineConfig, seedPipelineEngines, onPipelineConfig,
+  VOICE_ENGINE_IDS, GEMINI_LIVE_MODEL, GEMINI_LIVE_VOICE,
   type PipelineConfig,
 } from "./pipelineConfig.ts";
 import { useVoicePrefs } from "../prefs.ts";
@@ -391,6 +392,39 @@ test("side talk log: off by default and for anything but an explicit yes", () =>
   assert.equal(mergePipelineConfig({ sideTalk: "shadow" }).sideTalkLog, false);
   assert.equal(mergePipelineConfig({ sideTalkLog: "yes" }).sideTalkLog, false);
   assert.equal(mergePipelineConfig({ sideTalkLog: true }).sideTalkLog, true);
+});
+
+test("voice engine: the cascade by default and for a config saved before it; the native one sticks, a bad one falls back", () => {
+  assert.equal(DEFAULT_PIPELINE_CONFIG.engine, "cascade");
+  assert.equal(mergePipelineConfig({}).engine, "cascade");
+  assert.equal(mergePipelineConfig({ language: "bn" }).engine, "cascade");
+  assert.equal(mergePipelineConfig({ engine: "realtime" }).engine, "realtime");
+  assert.equal(mergePipelineConfig({ engine: "telepathy" }).engine, "cascade");
+  assert.equal(mergePipelineConfig({ engine: 7 }).engine, "cascade");
+  assert.deepEqual([...VOICE_ENGINE_IDS], ["cascade", "realtime"]);
+});
+
+test("the native engine's own settings: defaulted, trimmed and clamped, never mixed into the cascade's", () => {
+  const d = DEFAULT_PIPELINE_CONFIG.realtime;
+  assert.deepEqual(d, { model: GEMINI_LIVE_MODEL, voice: GEMINI_LIVE_VOICE, silenceDurationMs: 900 });
+  // Off unless asked for: a config saved before it runs the cascade with these as
+  // the seed a first switch to "realtime" uses.
+  assert.deepEqual(mergePipelineConfig({}).realtime, d);
+  assert.deepEqual(mergePipelineConfig({ realtime: { model: "  gemini-3.8-live ", voice: " Puck ", silenceDurationMs: 1200 } }).realtime,
+    { model: GEMINI_LIVE_MODEL, voice: "Puck", silenceDurationMs: 1200 });
+  // Garbage fields fall back one by one, not whole.
+  for (const bad of [null, "nonsense", 7, [], { model: "", voice: "", silenceDurationMs: "soon" }]) assert.deepEqual(mergePipelineConfig({ realtime: bad }).realtime, d);
+  assert.equal(mergePipelineConfig({ realtime: { silenceDurationMs: 10 } }).realtime.silenceDurationMs, 200);
+  assert.equal(mergePipelineConfig({ realtime: { silenceDurationMs: 99999 } }).realtime.silenceDurationMs, 3000);
+  assert.equal(clampPipelineConfig(full({ engine: "realtime", realtime: { model: "m", voice: "v", silenceDurationMs: 900 } })).engine, "realtime");
+});
+
+test("a saved config keeps every other field when only the engine is switched", () => {
+  const saved = mergePipelineConfig({ engine: "realtime", tts: { voice: "am_onyx", speed: 1.2 } });
+  assert.equal(saved.engine, "realtime");
+  assert.equal(saved.tts.voice, "am_onyx");
+  assert.equal(saved.tts.speed, 1.2);
+  assert.deepEqual(saved.realtime, DEFAULT_PIPELINE_CONFIG.realtime);
 });
 
 const LIGHT = new Set(["moonshine-base-en-int8", "piper-en_US-libritts_r-medium-int8", "piper-de_DE-thorsten-medium-int8", "canary-180m-flash-int8"]);

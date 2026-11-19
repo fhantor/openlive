@@ -7,6 +7,7 @@ import { allowedEfforts } from "@openlive/harness/types";
 import { api } from "@/lib/api";
 import { toast } from "@/lib/toast";
 import { useApiModeChoice } from "@/lib/live/useApiModeChoice";
+import { cascadeModels } from "@/lib/live/pipelineConfig";
 import { apiSummary } from "@/lib/live/howItRuns";
 import { HowItRuns, Field, Picker, AutoControl, ThinkNote, THINK_HINT, effortName } from "./SetupControls";
 import { linkClass } from "@/components/ui";
@@ -60,7 +61,9 @@ export function ModelQuickPick({ onOpenSettings }: { onOpenSettings: () => void 
           placeholder={!hasKey ? "Add an API key to load models" : modelsLoading ? "Loading models…" : modelsError ? modelsError.message : models.length ? "Recommended" : "No models available"}
           options={[
             { id: "", name: "Recommended", detail: "Let OpenLive pick a fast one", starred: true },
-            ...models.map((m) => ({ id: m.id, name: m.display_name })),
+            // The native engine's own model is hidden here: it speaks Gemini's
+            // BidiGenerateContent socket, not /chat/completions (pipelineConfig.ts).
+            ...cascadeModels(models).map((m) => ({ id: m.id, name: m.display_name })),
           ]} />
         {/* Same badge row as Settings → Models (ModelBadges), abbreviated for the panel. */}
         {model && (
