@@ -243,6 +243,13 @@ export class RealtimeSession {
   private lastOnsetMs = 0;
   private lastPlaybackEndMs: number | undefined;
   private lastEchoSafe = true;
+  /** True once the renderer reported speech, until it reports the utterance ended.
+   *  One `audioStreamEnd` per utterance closes the Gemini turn; without it the model
+   *  hears everything and answers nothing (measured 2026-11-20). */
+  private spokeSinceIdle = false;
+  /** PCM bytes received since the last audioStreamEnd; a non-zero count means there is
+   *  an utterance to close even if no speaking:true transition was ever reported. */
+  private micBytesSinceEnd = 0;
 
   /** Permission/elicitation asks the coding agent is waiting on, by wire id. */
   private readonly pendingAsks = new Map<string, PendingAsk>();
@@ -436,6 +443,7 @@ export class RealtimeSession {
    *  forwards whole chunks and never re-frames them itself (the rollback rule). */
   private onBinary(buf: Buffer): void {
     if (this.closed || !buf.length) return;
+    this.micBytesSinceEnd += buf.length;
     this.gemini?.pushMicPcm16(buf);
   }
 
@@ -463,6 +471,21 @@ export class RealtimeSession {
         this.lastOnsetMs = Number.isFinite(msg.onsetMs) ? Number(msg.onsetMs) : 0;
         this.lastPlaybackEndMs = typeof msg.playbackEndMs === "number" ? msg.playbackEndMs : undefined;
         this.lastEchoSafe = msg.echoSafe !== false;
+        // The renderer's VAD says the utterance is over. Tell Gemini so, or the turn never
+        // closes: measured 2026-11-20, a continuous mic stream with automatic activity
+        // detection reports ACTIVITY_START and then waits for an end that never arrives, so
+        // the model never answers — no transcript, no tool call, no audio at all.
+        // `audioStreamEnd` is the documented client signal for "that was the whole utterance".
+        if (msg.speaking) {
+          this.spokeSinceIdle = true;
+        } else if (this.spokeSinceIdle || this.micBytesSinceEnd > 0) {
+          // Close the utterance whenever audio actually arrived since the last close —
+          // not only when a speaking:true transition was seen. A renderer that streams
+          // PCM and reports only the end of speech must still get its turn answered.
+          this.spokeSinceIdle = false;
+          this.micBytesSinceEnd = 0;
+          this.gemini?.sendAudioStreamEnd();
+        }
         return;
       }
       case "draft_action": {
@@ -600,6 +623,13 @@ export class RealtimeSession {
   private onInputTranscription(e: { text: string; finished?: boolean }): void {
     if (this.closed) return;
     this.inputBuf += e.text;
+    // Gemini does NOT reliably set `finished:true` — measured 2026-11-20 on this key:
+    // every inputTranscription frame arrived with finished=false, and the turn then
+    // ended (toolCall / turnComplete). Gating the flush on `finished===true` alone
+    // therefore swallowed EVERY user transcript: no caption, no persistence, and —
+    // worse — key 2 never ran, so a spoken "হ্যাঁ, পাঠাও" could never validate a
+    // draft. Flush on a real turn boundary as well (turnComplete/generationComplete
+    // call flushInput), which is what the ACP turn actually is.
     if (e.finished === true) this.flushInput();
   }
 
@@ -656,6 +686,11 @@ export class RealtimeSession {
   // ── the six tools (all synchronous, all from memory) ────────────────────
 
   private onToolCalls(e: { calls: GeminiFunctionCall[]; socketSeq: number }): void {
+    // The user's utterance for this turn is complete by the time the model acts on it —
+    // Gemini ends the input transcript at the tool call, and (measured) never sets
+    // finished:true. Flushing here is what lets key 2 see the words, and what makes the
+    // user's own turn persist at all.
+    this.flushInput();
     const responses: GeminiFunctionResponse[] = [];
     const started = this.now();
     for (const call of e.calls) responses.push(this.runTool(call));

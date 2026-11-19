@@ -68,6 +68,7 @@ class FakeGemini extends EventEmitter {
     this.phase = "live";
     this.emit("phase", { phase: "live" });
   }
+  streamEnds = 0;
   async sleep(reason?: string): Promise<void> {
     this.sleepCalls += 1;
     this.phase = "sleeping";
@@ -86,7 +87,7 @@ class FakeGemini extends EventEmitter {
   }
   pushMicPcm16(chunk: Buffer): void { this.mic.push(Buffer.from(chunk)); }
   setMuted(m: boolean): void { this.muted = m; }
-  sendAudioStreamEnd(): void {}
+  sendAudioStreamEnd(): void { this.streamEnds += 1; }
   sendRealtimeText(text: string): void { this.texts.push(text); }
   sendSilentSync(turns: Array<Record<string, any>>): void { this.silentSyncs.push(turns); }
   sendToolResponses(responses: Array<Record<string, any>>): boolean {
@@ -834,5 +835,33 @@ describe("every Live handler returns from memory", () => {
     host1.finish();
     await waitUntil(() => host1.disposed && host2.calls.restore === 1, "the orphan hand-off");
     await c2.close();
+  });
+  test("the utterance's end closes the Gemini turn: one audioStreamEnd per utterance", async () => {
+    // Measured on the real API 2026-11-20: a continuous mic stream with automatic
+    // activity detection reports ACTIVITY_START and then waits for an end that never
+    // arrives, so the model answers nothing — no transcript, no tool call, no audio.
+    // The renderer's end-of-speech report must reach the model as audioStreamEnd.
+    const c = await live("rt-stream-end");
+    const gem = latestClient();
+    gem.emit("phase", { phase: "live" });
+
+    // Audio arrives, then the renderer reports speech ended.
+    c.binary(Buffer.alloc(320, 0x11));
+    c.binary(Buffer.alloc(320, 0x11));
+    c.send({ t: "vad_state", speaking: true, onsetMs: 0, echoSafe: true });
+    c.send({ t: "vad_state", speaking: false, onsetMs: 0, echoSafe: true });
+    await waitUntil(() => gem.streamEnds === 1, "one audioStreamEnd for the utterance");
+
+    // A second silence report does not close a turn that is already closed — one end
+    // per utterance, or the model is told repeatedly that nothing more is coming.
+    c.send({ t: "vad_state", speaking: false, onsetMs: 0, echoSafe: true });
+    await sleep(30);
+    expect(gem.streamEnds).toBe(1);
+
+    // A new utterance (audio, no speaking:true transition required) closes again.
+    c.binary(Buffer.alloc(320, 0x11));
+    c.send({ t: "vad_state", speaking: false, onsetMs: 0, echoSafe: true });
+    await waitUntil(() => gem.streamEnds === 2, "the second utterance's end");
+    await c.close();
   });
 });
