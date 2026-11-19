@@ -2,8 +2,9 @@ import { randomUUID } from "node:crypto";
 import type { WebSocket } from "ws";
 import type { SseEvent, MessageBlock, LiveServerMsg } from "@openlive/shared";
 import { LIVE_TAG, liveClientMsgSchema, agentLabel, classifyError, startReasonOf, toolSummary, withReplyLanguage, type AgentMetaWire, type LanguageCode } from "@openlive/shared";
-import { createChat, addMessage, updateMessageContent, listMessages, renameChat, getSetting, setSetting, setChatContext, deleteChatsBefore } from "@openlive/db";
+import { createChat, addMessage, updateMessageContent, listMessages, renameChat, getSetting, setSetting, deleteChatsBefore } from "@openlive/db";
 import { historyKeep, KEEP_MS } from "@openlive/flow-store/shared";
+import { layout, resolveHome } from "@openlive/shared/home";
 import type { Message } from "@openlive/harness";
 import type { Approve, Emit, Session, Tool } from "../capabilities/types.js";
 import { registry } from "../capabilities/registry.js";
@@ -11,15 +12,15 @@ import { CHAT } from "../capabilities/profiles.js";
 import { offerOf, ToolSet } from "../capabilities/dispatch.js";
 import { bridgedDevice, DEVICE_TIMEOUT_MS } from "../capabilities/device.js";
 import { computer } from "../computer/helper.js";
-import { MCP_SERVER_NAME, serveMcp } from "../capabilities/mcp.js";
 import { slashSkill } from "../skills/tools.js";
 import { finalizeToolBlocks, foldBlock, newFoldCtx, type FoldCtx } from "../block-emit.js";
 import { LiveTurnRunner } from "./turn-runner.js";
 import { narrationEnabled, wrapEmitWithNarration, createCommentaryGate } from "./narrator.js";
-import { hostedBy } from "../agents/mcp-config.js";
-import { createBoundAgent, setBoundAgent, boundAgent, agentCwd, PERMISSION_CANCELLED, type Agent, type AgentId, type ElicitationAnswer, type ElicitationAsk, type PermissionAskOption, type ReplayMessage } from "../agents/index.js";
+import { boundAgent, type AgentId, type ElicitationAnswer, type ElicitationAsk, type PermissionAskOption, type ReplayMessage } from "../agents/index.js";
+import { AcpHost, ALLOW_OR_DENY } from "./acp-host.js";
+import { Ledger } from "./ledger.js";
 import { emitFact, type AgentFactProps } from "../telemetry/emit.js";
-import { askOutcome, brainOf, modelFact, permissionFact, toolTally, reportReply, reportTurnError, TurnTimer, type Brain as BrainIdent, type PermissionOutcome } from "../telemetry/facts.js";
+import { brainOf, modelFact, toolTally, reportReply, reportTurnError, TurnTimer, type Brain as BrainIdent } from "../telemetry/facts.js";
 import { resolveLive } from "../providers.js";
 import { log } from "../log.js";
 import { cancelledText, sentAside } from "../turn.js";
@@ -31,8 +32,6 @@ const HISTORY_TURNS = 20; // recent messages to rehydrate on reconnect
 const BRIDGE_TIMEOUT_MS = 5_000;
 /** Tools whose work shows on its own: the worker's searches, and the checklist. */
 const OWN_UI = new Set(["delegate", "update_todos"]);
-/** Kinds given, so a no is counted as one and the client maps a spoken answer. */
-const ALLOW_OR_DENY: PermissionAskOption[] = [{ id: "allow", label: "Allow", kind: "allow_once" }, { id: "deny", label: "Deny", kind: "reject_once" }];
 
 // Some providers (e.g. MiniMax) leak control-token fragments like "[e[" into the
 // text stream. Scrub ONLY those bracket-pair fragments — NOT every bracket: coding
@@ -72,17 +71,6 @@ function truncateSpokenText(blocks: MessageBlock[], spoken: string): void {
   if (!placed && s) blocks.unshift({ type: "text", text: s });
 }
 
-/** The agent reports its use of the call's own tools as tool calls of its own.
- *  Dropped, so they show as the built-in brain's do and not twice; their ids
- *  are kept in `hidden`. */
-function hideHosted(emit: Emit, hidden: Set<string>): Emit {
-  return (e) => {
-    if (e.type === "acp_tool_call" && hostedBy(e.call.title, MCP_SERVER_NAME)) hidden.add(e.call.id);
-    const id = e.type === "acp_tool_call" ? e.call.id : e.type === "acp_tool_update" ? e.delta.id : "";
-    return id && hidden.has(id) ? undefined : emit(e);
-  };
-}
-
 // One live call — THIN. The browser runs the whole voice stack (VAD, STT, turn
 // detection, TTS) on-device; this server only receives the final user text + the
 // freshest camera frame, runs the LLM turn, streams reply text back, and PERSISTS
@@ -90,18 +78,11 @@ function hideHosted(emit: Emit, hidden: Set<string>): Emit {
 export class LiveSession {
   private runner: LiveTurnRunner;
   private toolSession: Session;
-  // When bound, a coding agent (Claude Code / Codex / Cursor) is the brain instead
-  // of the provider loop. `agentReady` resolves once the ACP handshake completes.
-  private agent: Agent | null = null;
-  private boundId: AgentId | null = null;
-  private boundCwd = ""; // the agent's project folder for this conversation (rebuild on change)
+  /** ACP for this conversation — binding, the hosted MCP server, asks, steering.
+   *  Extracted so /live and /realtime share one implementation; the session keeps
+   *  only what is about being a VOICE CALL. */
+  private readonly host: AcpHost;
   private lastMeta: AgentMetaWire | null = null; // last agent_meta sent — re-sent on a same-bind rebind
-  private elicitPending = new Map<string, (a: ElicitationAnswer) => void>(); // by reqId
-  private elicitById = new Map<string, (a: ElicitationAnswer) => void>();    // by agent elicitationId (URL completion)
-  private lastBind: Promise<void> = Promise.resolve(); // most recent applyBind, awaited by start()
-  private agentReady: Promise<void> | null = null;
-  private agentAc: AbortController | null = null;
-  private permPending = new Map<string, (optionId: string, outcome?: PermissionOutcome) => void>(); // agent permission asks awaiting the user
   private agentStartMs = 0; // what the bound agent took to start; 0 without one
   // How the agent's session came up. It is known in the lobby, before the call's
   // record opens, so each turn's fact carries it in.
@@ -109,9 +90,6 @@ export class LiveSession {
   private warmAc: AbortController | null = null; // aborts the cache-warm request on teardown
   private ac: AbortController | null = null;
   private turnActive = false;
-  // The agent's ids for its calls to the call's own tools in a stopped turn:
-  // refused should one land late, in the next turn.
-  private deadHosted = new Set<string>();
   // An utterance (with its frames) that arrived mid-turn (barge-in), drained when the
   // current turn settles. Frames are queued too so a barge-in with the camera on
   // doesn't lose what the user was showing.
@@ -125,17 +103,13 @@ export class LiveSession {
   // its text far faster than speech, so most barge-ins land after the turn is over.
   private lastReply: { id: string; blocks: MessageBlock[]; byRunner: boolean } | null = null;
   private startup: Promise<void> = Promise.resolve();
-  private bindEpoch = 0;                      // guards applyBind against re-entrant/overlapping binds
   private expectReplay = false;               // this chat was empty when a resume began → persist recovered turns
-  private frameChain: Promise<unknown> = Promise.resolve(); // serialize concurrent `look` frame grabs
   private cameraOn = false;
   private screenOn = false;
   private titled = false;                  // rename the chat from the first user turn
   private closed = false;
 
-  // `look` tool ↔ client hi-res frame handshake.
-  private lookPending: { reqId: string; resolve: (f: Frame | null) => void } | null = null;
-  private awaitingLookFrame = false;
+  // `look` tool ↔ client hi-res frame handshake: the pending slot lives in the host.
   // OS bridge (clipboard / open_url / the device) ↔ client handshake. The client
   // runs the action via Electron and replies; on the web it replies "not available".
   private bridgePending = new Map<string, (out: string) => void>();
@@ -143,7 +117,6 @@ export class LiveSession {
   // built-in brain runs, so one implementation answers both.
   private tools: ToolSet;
   private approve: Approve;
-  private mcp: ReturnType<typeof serveMcp> | null = null;
   /** The running turn's emit, so a tool shows its chip in that turn. */
   private toolEmit: Emit = () => {};
   /** A timer or reminder that went off, for the client to show and say. */
@@ -158,15 +131,41 @@ export class LiveSession {
       openUrl: (url) => this.bridge("open_url", url),
       share: { showing: () => (this.screenOn ? "screen" : this.cameraOn ? "camera" : null), frame: () => this.requestFrame() },
       // Read live, so the file tools track a folder change mid-call.
-      workspace: () => this.boundCwd,
+      workspace: () => this.host.cwd,
       emit: (e) => this.toolEmit(e),
       elicit: (req) => this.askElicitation(req),
       ...(device && { device: bridgedDevice((arg) => this.bridge("flow_device", arg, DEVICE_TIMEOUT_MS), async () => (this.cameraOn ? this.requestFrame() : null)) }),
       ...(device && computer.available() && { computer }),
     };
     this.tools = this.callTools();
-    this.approve = CHAT.approval((question) => this.askPermission(question, ALLOW_OR_DENY).then((id) => id === "allow"));
+    const call = this;
+    this.approve = CHAT.approval((question) => call.askPermission(question, ALLOW_OR_DENY).then((id) => id === "allow"));
     this.runner = new LiveTurnRunner(this.tools, this.toolSession, { approve: this.approve, tally: toolTally("call") });
+    // ACP, hosted by its own object: the same code /realtime will use. Everything
+    // it needs from the session is a callback, so the two never import each other.
+    this.host = new AcpHost({
+      chatId: this.chatId,
+      closed: () => this.closed,
+      send: (m) => this.send(m),
+      session: () => this.toolSession,
+      tools: () => this.tools,
+      approve: this.approve,
+      tally: toolTally("call"),
+      ledger: new Ledger(this.chatId, layout(resolveHome()).data, () => Date.now()),
+      turnActive: () => this.turnActive,
+      turnSignal: () => this.ac?.signal ?? null,
+      replyTurn: () => this.replyTurn,
+      seed: () => this.rehydrate(),
+      pendingCut: () => this.pendingCut(),
+      onMeta: (meta) => { this.lastMeta = meta; },
+      onReplay: (msgs) => this.ingestReplay(msgs),
+      onReplayExpected: (wanted) => { this.expectReplay = wanted; },
+      onResumed: (how) => { this.resumed = how; },
+      onFolderMoved: () => { this.tools = this.callTools(); this.runner.tools = this.tools; },
+      onStarted: (ms) => { this.agentStartMs = ms; },
+      onReady: () => this.send({ t: "sse", event: { type: "status", text: "ready" } }),
+      onStartError: (e) => this.reportStartError(e),
+    });
 
     ws.on("message", (data: Buffer, isBinary: boolean) => {
       if (isBinary) this.onBinary(data);
@@ -192,13 +191,9 @@ export class LiveSession {
       if (prior.length) this.runner.seed(prior);
     }
     // Resume a persisted bind — but ONLY if the client's own bind hasn't already
-    // arrived. The client re-sends its choice the moment the socket opens, and on a
-    // NEW chat that message can beat this restore: the restore then read stale/empty
-    // DB state, superseded the client's bind via the epoch guard, and quietly
-    // reversed it — agent + folder shown in the UI, nothing bound on the server.
-    if (this.bindEpoch === 0) await this.applyBind(this.chatId ? boundAgent(this.chatId) : null);
-    else await this.lastBind; // let the in-flight client bind finish deciding
-    if (this.agent) return;
+    // arrived (the host keeps the epoch guard and the same reasoning).
+    await this.host.restore();
+    if (this.host.running) return;
     // Warm the prompt cache + connection in the background so the first spoken turn
     // answers fast. Tell the client when it's done (drives the "Warming up…" spinner);
     // always signal ready, even on failure, so the indicator never sticks.
@@ -227,11 +222,9 @@ export class LiveSession {
 
   // ── inbound ───────────────────────────────────────────────────────────────
   private onBinary(buf: Buffer) {
-    if (buf[0] !== LIVE_TAG.FRAME_IN) return;
-    if (!this.awaitingLookFrame || !this.lookPending) return;
-    const p = this.lookPending;
-    this.lookPending = null; this.awaitingLookFrame = false;
-    p.resolve({ data: Buffer.from(buf.subarray(1)).toString("base64"), mime: "image/jpeg" });
+    // The only binary a call receives is the JPEG the `look` handshake awaited —
+    // the host holds that slot, so it is the one that resolves it.
+    this.host.onFrame(buf);
   }
 
   private async onText(str: string) {
@@ -243,8 +236,8 @@ export class LiveSession {
         // it there, so a sentence landing here was said before the ask reached the
         // client, which then drops the ask as an older turn's: nobody can answer it. It
         // is refused, and the sentence is a turn like any other.
-        this.cancelPendingPermissions();
-        this.cancelPendingElicitations();
+        this.host.cancelPendingPermissions();
+        this.host.cancelPendingElicitations();
         return void this.runTurn(msg.text, msg.frames ?? [], msg.lang, msg.turn, msg.wordsAt, msg.speaker, msg.aside, msg.typed);
       case "cancel":
         emitFact("call", { interrupted: 1 });
@@ -261,27 +254,25 @@ export class LiveSession {
         else if (msg.action === "end") this.dispose();
         return;
       case "frame_response":
-        if (this.lookPending?.reqId !== msg.reqId) return;
-        if (msg.failed) { const p = this.lookPending; this.lookPending = null; this.awaitingLookFrame = false; p.resolve(null); }
-        else this.awaitingLookFrame = true;
+        this.host.onFrameResponse(msg.reqId, msg.failed);
         return;
       case "tool_bridge_result": {
         const r = this.bridgePending.get(msg.reqId);
         if (r) { this.bridgePending.delete(msg.reqId); r(msg.output); }
         return;
       }
-      case "bind": return this.applyBind(msg.agentId, msg.cwd, msg.resumeSessionId);
+      case "bind": return this.host.applyBind(msg.agentId, msg.cwd, msg.resumeSessionId);
       case "permission_response": {
-        this.permPending.get(msg.reqId)?.(msg.optionId); // settle() clears the map + notifies the client
+        this.host.answerPermission(msg.reqId, msg.optionId); // settle() clears the map + notifies the client
         return;
       }
       case "elicitation_response": {
-        this.elicitPending.get(msg.reqId)?.({ action: msg.action, content: msg.content as Record<string, unknown> | undefined });
+        this.host.answerElicitation(msg.reqId, msg.action, msg.content as Record<string, unknown> | undefined);
         return;
       }
-      case "set_model": { this.agent?.setModel?.(msg.modelId)?.catch((e) => log.error("live", "set_model:", e)); return; }
-      case "set_mode": { this.agent?.setMode?.(msg.modeId)?.catch((e) => log.error("live", "set_mode:", e)); return; }
-      case "set_option": { this.agent?.setOption?.(msg.optionId, msg.valueId)?.catch((e) => log.error("live", "set_option:", e)); return; }
+      case "set_model": { this.host.setModel(msg.modelId).catch((e) => log.error("live", "set_model:", e)); return; }
+      case "set_mode": { this.host.setMode(msg.modeId).catch((e) => log.error("live", "set_mode:", e)); return; }
+      case "set_option": { this.host.setOption(msg.optionId, msg.valueId).catch((e) => log.error("live", "set_option:", e)); return; }
     }
   }
 
@@ -355,7 +346,7 @@ export class LiveSession {
     const gate = createCommentaryGate(narrated, ac.signal);
     this.toolEmit = gate.emit;
     try {
-      await this.agentReady?.catch(() => {}); // wait out the ACP handshake on the first turn
+      await this.host.ready.catch(() => {}); // wait out the ACP handshake on the first turn
       await this.cutSaved;
       if (this.chatId && getSetting(`agentCut:${this.chatId}`)) await setSetting(`agentCut:${this.chatId}`, "");
       // A typed "/name" loads that OpenLive skill for the turn, unless the bound
@@ -366,20 +357,21 @@ export class LiveSession {
         ? await slashSkill(text, this.tools, { ...this.toolSession, signal: ac.signal, context: null })
         : null;
       if (skill) said = `${skill.content}\n\n${skill.rest || `Use the ${skill.name} skill.`}`;
-      if (this.agent) {
-        await this.agent.runTurn({ text: withReplyLanguage(said, lang), frames, ...(!aside && !skill && text.trimStart().startsWith("/") && { command: text }) }, hideHosted(gate.emit, hosted), ac.signal);
+      // The agent's own turn goes through the host, so /realtime drives it the same
+      // way. `hide` drops its report of OpenLive's own tools, which show once.
+      if (await this.host.runTurn({ text: withReplyLanguage(said, lang), frames, ...(!aside && !skill && text.trimStart().startsWith("/") && { command: text }) }, this.host.hide(gate.emit, hosted), ac.signal)) {
         await gate.flush();
-      } else if (this.boundId) {
+      } else if (this.host.id) {
         // A coding agent is bound but not running (no folder yet, or its start
         // failed). NEVER answer with the built-in brain as if it were the agent —
         // that silently swaps who the user is talking to. Say what's wrong instead.
-        const label = agentLabel(this.boundId);
+        const label = agentLabel(this.host.id);
         await emit({
           type: "error",
-          message: this.boundCwd
+          message: this.host.cwd
             ? `${label} isn't connected yet. Give it a moment, or switch agents and back to retry.`
             : `${label} needs a project folder before it can start. Pick one from the folder menu in the top bar, then ask again.`,
-          code: this.boundCwd ? "agent_start_failed" : "agent_no_folder",
+          code: this.host.cwd ? "agent_start_failed" : "agent_no_folder",
         });
       } else {
         await this.runner.runTurn(said, frames, gate.emit, ac.signal, lang);
@@ -395,10 +387,11 @@ export class LiveSession {
       // Turn is over (normally, barge-in, watchdog cut, or error) — never leave an
       // agent permission ask dangling; answer it cancelled (ACP MUST). No-op unless
       // one was actually pending.
-      this.cancelPendingPermissions();
+      this.host.endTurn();
       this.toolEmit = () => {};
-      for (const id of ac.signal.aborted ? hosted : []) this.deadHosted.add(id);
-      const byRunner = !this.agent && !this.boundId;
+      // A stopped turn's calls to OpenLive's own tools are refused if they land late.
+      if (ac.signal.aborted) this.host.refuseLate(hosted);
+      const byRunner = !this.host.running && !this.host.id;
       // On barge-in, persist only what was actually SPOKEN.
       if (ac.signal.aborted && this.bargeSpoken != null) {
         truncateSpokenText(blocks, this.bargeSpoken);
@@ -458,7 +451,7 @@ export class LiveSession {
    *  brings it back: the cut waits in the settings until a turn has told it. A
    *  cancelled request waits there for the built-in brain's next call too. */
   private cutAgentReply(spoken: string, cancelled = false) {
-    this.agent?.cut?.(spoken, cancelled);
+    this.host.cut(spoken, cancelled);
     if (this.chatId) this.cutSaved = setSetting(`agentCut:${this.chatId}`, JSON.stringify({ spoken, cancelled })).catch(() => {});
   }
 
@@ -472,15 +465,7 @@ export class LiveSession {
 
   private interrupt() {
     this.ac?.abort();
-    this.cancelPendingPermissions();
-    this.cancelPendingElicitations();
-  }
-
-  /** Answer any in-flight agent permission ask as cancelled (ACP MUST when a turn is
-   *  cancelled — barge-in OR a watchdog cut). Idempotent: settle() removes each from
-   *  the map (so iterate a copy) and no-ops if already settled. */
-  private cancelPendingPermissions() {
-    for (const settle of [...this.permPending.values()]) settle(PERMISSION_CANCELLED);
+    this.host.endTurn();
   }
 
   /** Persist + surface prior turns recovered from an agent's session/load. Only
@@ -503,123 +488,42 @@ export class LiveSession {
     } catch (e) { log.error("live", "replay ingest:", e); }
   }
 
-  // ── agent binding ─────────────────────────────────────────────────────────
-  /** Bind (or unbind) this conversation to a coding agent, optionally with a project
-   *  folder. Rebuilds + reconnects the ACP agent when the agent OR folder changes;
-   *  a no-op when neither did (an agent's cwd is fixed at spawn, so a folder switch
-   *  means a restart). */
-  private async applyBind(id: AgentId | null, cwd?: string, resumeSessionId?: string) {
-    // Re-entrancy guard: applyBind awaits several writes, and binds can overlap (a
-    // fast agent/folder switch, or a resume racing a reconnect). Stamp an epoch and
-    // bail the moment a newer bind supersedes this one — otherwise two runs each spawn
-    // an agent and the older one leaks an orphaned ACP child-process tree.
-    const epoch = ++this.bindEpoch;
-    const run = this.applyBindInner(id, cwd, resumeSessionId, epoch);
-    this.lastBind = run.catch(() => {});
-    await run;
-    // Authoritative echo — whatever this bind attempt ended up with (including the
-    // superseding-bind and no-folder paths that return early above), tell the client
-    // what the session is ACTUALLY using so its chips can't drift from reality.
-    if (epoch === this.bindEpoch && !this.closed) {
-      this.send({ t: "bound_state", agentId: this.boundId, cwd: this.boundCwd, agentActive: !!this.agent });
-    }
+  /** The agent failed to start: say so on the wire and count it, naming the fix. */
+  private reportStartError(e: unknown): void {
+    const id = this.host.id;
+    const text = String((e as Error)?.message ?? e);
+    const event = { type: "error" as const, message: startReasonOf(e) ? text : `Couldn't start ${id}: ${text}`, code: classifyError(e, "agent_start_failed") };
+    this.send({ t: "sse", event });
+    reportTurnError("call", this.brain(), { ...event, startReason: startReasonOf(e) });
   }
 
-  private async applyBindInner(id: AgentId | null, cwd: string | undefined, resumeSessionId: string | undefined, epoch: number) {
-    // These two MUST land before agentCwd()/createBoundAgent read them back.
-    if (cwd !== undefined && this.chatId) await setSetting(`agentCwd:${this.chatId}`, cwd);
-    if (epoch !== this.bindEpoch) return; // superseded while awaiting
-    // Commit point: only a live bind writes below. The bind is stored BEFORE the session
-    // is cleared, so a bind that supersedes this one sees the new agent and clears too,
-    // never finds the old agent with its session already gone.
-    const agentChanged = !!this.chatId && id !== boundAgent(this.chatId); // a different agent can't load the old one's session
-    if (this.chatId) await setBoundAgent(this.chatId, id);
-    if (epoch !== this.bindEpoch) return;
-    // Resuming one of the agent's OWN prior sessions (from History): stamp its ACP
-    // session id so createBoundAgent loadSession-s it instead of starting fresh.
-    if (this.chatId && (resumeSessionId || agentChanged)) await setSetting(`acpSession:${this.chatId}`, resumeSessionId ?? "");
-    if (epoch !== this.bindEpoch) return;
-    // Canonical, per-chat→global — the SAME resolution the agent spawns in, so the
-    // rebuild guard below and History grouping stay consistent.
-    const effectiveCwd = this.chatId ? agentCwd(this.chatId) : "";
-    // Stamp the session's agent + workspace so the History sidebar can file it
-    // under agent → workspace → session.
-    if (this.chatId) await setChatContext(this.chatId, id, effectiveCwd, agentChanged);
-    if (epoch !== this.bindEpoch) return;
-    if (id === this.boundId && effectiveCwd === this.boundCwd && this.agent) {
-      // Same bind, agent already up. The client may have cleared its model/mode
-      // chips (start() reuses the prewarmed socket and nulls them) — re-send the
-      // last meta so they come back without a rebuild.
-      if (this.lastMeta) this.send({ t: "agent_meta", ...this.lastMeta });
-      return;
-    }
-    const moved = effectiveCwd !== this.boundCwd;
-    this.agentAc?.abort();
-    void this.agent?.dispose();
-    this.agent = null; this.agentReady = null; this.lastMeta = null; this.boundId = id; this.boundCwd = effectiveCwd; this.agentStartMs = 0; this.resumed = undefined;
-    if (moved) { this.tools = this.callTools(); this.runner.tools = this.tools; }
-    if (!id || this.closed || !this.chatId) return;
-    // A coding agent needs a real folder. Don't spawn (then instantly kill) one with
-    // no cwd — that surfaced a spurious "pick a folder" error and churned processes on
-    // the first bind. Wait for a bind that supplies a folder (the lobby gates Start on it).
-    if (!effectiveCwd) return;
-    // Decide replay-persistence NOW, before any user turn can persist a message — so a
-    // user who speaks before the session/load finishes doesn't make ingestReplay think
-    // the chat is OpenLive-origin and drop the recovered transcript.
-    this.expectReplay = !!resumeSessionId && listMessages(this.chatId).length === 0;
-    const call = this;
-    const mcp = await (this.mcp ??= serveMcp({
-      // Read per request, so a new folder's skills are served once it is bound.
-      get tools() { return call.tools; },
-      // A call arriving outside a turn is refused, as the built-in brain never makes
-      // one, and so is one a stopped turn made that lands in the next.
-      ctx: (agentCallId) => ({ ...this.toolSession, context: null, signal: (agentCallId && this.deadHosted.has(agentCallId) ? null : this.ac?.signal) ?? AbortSignal.abort() }),
-      approve: this.approve,
-      tally: toolTally("call"),
-    }));
-    if (epoch !== this.bindEpoch || this.closed) return;
-    const agent = createBoundAgent(this.chatId, (q, o, toolCallId) => this.askPermission(q, o, toolCallId), {
-      onMeta: (meta) => { this.lastMeta = meta; if (!this.closed) this.send({ t: "agent_meta", ...meta }); },
-      // Recovered transcript from a session/load — persist + tell the client to reload.
-      onReplay: (msgs) => this.ingestReplay(msgs),
-      askElicitation: (req) => this.askElicitation(req),
-      completeElicitation: (elicitationId) => this.elicitById.get(elicitationId)?.({ action: "accept" }),
-      mcp: { wire: mcp.wire, tools: this.tools.list.map((t) => t.name) },
-      replay: this.expectReplay,
-      onResumed: (how) => { this.resumed = how; },
-    });
-    if (!agent) return;
-    this.agent = agent;
-    const prior = this.rehydrate();
-    if (prior.length) agent.seed(prior);
-    const cut = this.pendingCut();
-    if (cut) agent.cut?.(cut.spoken, cut.cancelled);
-    const ac = new AbortController(); this.agentAc = ac;
-    const startedAt = performance.now();
-    this.agentReady = agent.start(ac.signal)
-      .then(() => {
-        this.agentStartMs = Math.round(performance.now() - startedAt);
-        if (!this.closed) this.send({ t: "sse", event: { type: "status", text: "ready" } });
-      })
-      .catch((e) => {
-        if (this.closed) return;
-        const text = String((e as Error)?.message ?? e);
-        const event = { type: "error" as const, message: startReasonOf(e) ? text : `Couldn't start ${id}: ${text}`, code: classifyError(e, "agent_start_failed") };
-        this.send({ t: "sse", event });
-        reportTurnError("call", this.brain(), { ...event, startReason: startReasonOf(e) });
-      });
+  // ── permission / elicitation / frames ─────────────────────────────────────
+  /** Relay an agent permission ask to the client and await the chosen option id. */
+  private askPermission(question: string, options: PermissionAskOption[], toolCallId?: string): Promise<string> {
+    return this.host.askPermission(question, options, toolCallId);
   }
+
+  /** Relay an agent elicitation (login URL / input form) to the client. */
+  private askElicitation(req: ElicitationAsk): Promise<ElicitationAnswer> {
+    return this.host.askElicitation(req);
+  }
+
+  // ── agent binding ─────────────────────────────────────────────────────────
+  // applyBind / applyBindInner, the epoch guard, createBoundAgent, serveMcp, the
+  // `acpSession:${chatId}` persistence, hideHosted/deadHosted, askPermission,
+  // askElicitation and requestFrame's frame handshake now live in `AcpHost`
+  // (./acp-host.js), so /realtime binds, hosts and asks through the same code.
 
   /** Who answers this call, as telemetry names it; nothing when settings cannot say. */
   private brain(): BrainIdent {
-    if (this.boundId) return brainOf("acp", this.boundId);
+    if (this.host.id) return brainOf("acp", this.host.id);
     try { return brainOf("api", resolveLive().provider.id); }
     catch { return {}; }
   }
 
   /** The family of the model answering this call; nothing when it cannot be told. */
   private modelFamily() {
-    if (this.boundId) return modelFact("", this.lastMeta);
+    if (this.host.id) return modelFact("", this.lastMeta);
     try { return modelFact(resolveLive().model); }
     catch { return {}; }
   }
@@ -637,8 +541,7 @@ export class LiveSession {
     if (offerOf(next) === offerOf(this.tools)) return;
     this.tools = next;
     this.runner.tools = next;
-    void this.mcp?.then((m) => m.toolsChanged()).catch(() => {});
-    this.agent?.toolsChanged?.(next.list.map((t) => t.name));
+    this.host.toolsChanged(next.list.map((t) => t.name));
   }
 
   /** A tool with its chip in the running turn, the same whichever brain calls it. */
@@ -654,89 +557,10 @@ export class LiveSession {
     };
   }
 
-  /** Relay an agent permission ask to the client (spoken + chips + inline on the
-   *  tool card when toolCallId is known) and await the chosen option id; times
-   *  out to "deny" so a hung decision never wedges a turn. */
-  private askPermission(question: string, options: PermissionAskOption[], toolCallId?: string): Promise<string> {
-    return new Promise((resolve) => {
-      if (this.closed) { permissionFact("call", "cancelled"); return resolve("deny"); }
-      // A cut or finished turn's late ask: its number is stale, so the client drops it,
-      // and left pending here it would take the next utterance as its answer.
-      if (!this.ac || this.ac.signal.aborted) { permissionFact("call", "cancelled"); return resolve(PERMISSION_CANCELLED); }
-      const reqId = randomUUID();
-      const PERM_TIMEOUT_MS = 120_000;
-      const expiresAt = Date.now() + PERM_TIMEOUT_MS; // client renders the countdown + speaks a reminder
-      // Single settle path for every outcome (answered / auto-deny / cancelled): it
-      // removes the pending entry AND tells the client the ask is resolved, so the
-      // chip is dismissed and a later utterance isn't mis-read as a yes/no answer.
-      const settle = (optionId: string, outcome?: PermissionOutcome) => {
-        if (!this.permPending.delete(reqId)) return; // already settled
-        clearTimeout(timer);
-        permissionFact("call", outcome ?? askOutcome(options, optionId));
-        this.send({ t: "permission_resolved", reqId });
-        resolve(optionId);
-      };
-      const timer = setTimeout(() => settle("deny", "timeout"), PERM_TIMEOUT_MS);
-      this.permPending.set(reqId, settle);
-      this.send({ t: "permission", reqId, question, options, expiresAt, toolCallId, turn: this.replyTurn });
-    });
-  }
-
-  /** Relay an agent elicitation (login URL / input form) to the client and await
-   *  the user's action. Same lifecycle discipline as askPermission: one settle
-   *  path, 120s timeout → cancel, dismissed client-side via elicitation_resolved.
-   *  URL elicitations also register under the agent's elicitationId so an
-   *  agent-side completion (OAuth landed) auto-accepts the card. */
-  private askElicitation(req: ElicitationAsk): Promise<ElicitationAnswer> {
-    return new Promise((resolve) => {
-      // Outside a turn only a request-scoped ask is live: ACP's scope for auth and
-      // setup before any session exists. A session-scoped one then is a finished
-      // turn's, and held it would take the next sentence as its answer.
-      if (this.closed || this.ac?.signal.aborted || (!this.ac && !req.requestScoped)) return resolve({ action: "cancel" });
-      emitFact("call", { elicitations: 1 });
-      const reqId = randomUUID();
-      const ELICIT_TIMEOUT_MS = 120_000;
-      const expiresAt = Date.now() + ELICIT_TIMEOUT_MS;
-      const settle = (a: ElicitationAnswer) => {
-        if (!this.elicitPending.delete(reqId)) return; // already settled
-        if (req.elicitationId) this.elicitById.delete(req.elicitationId);
-        clearTimeout(timer);
-        this.send({ t: "elicitation_resolved", reqId });
-        resolve(a);
-      };
-      const timer = setTimeout(() => settle({ action: "cancel" }), ELICIT_TIMEOUT_MS);
-      this.elicitPending.set(reqId, settle);
-      if (req.elicitationId) this.elicitById.set(req.elicitationId, settle);
-      // Unnumbered outside a turn, so the client shows it whichever turn it is on.
-      this.send({ t: "elicitation", reqId, mode: req.mode, message: req.message, url: req.url, schema: req.schema, expiresAt, turn: this.ac ? this.replyTurn : undefined });
-    });
-  }
-
-  /** Settle any in-flight elicitations as cancelled (turn end / teardown). */
-  private cancelPendingElicitations() {
-    for (const settle of [...this.elicitPending.values()]) settle({ action: "cancel" });
-  }
-
   // ── `look` handshake ────────────────────────────────────────────────────
-  /** Grab one fresh hi-res frame. SERIALIZED: the client↔server handshake has a
-   *  single in-flight slot (binary frames carry no reqId), so two concurrent `look`
-   *  calls (the turn-runner fans tool calls out with Promise.all) would otherwise
-   *  overwrite each other's slot — the first promise would never resolve and the
-   *  whole session would wedge (turnActive stuck true). Chaining makes each look
-   *  wait its turn; every one resolves (frame or null on timeout). */
+  /** Grab one fresh hi-res frame (serialized inside the host: one slot only). */
   private requestFrame(): Promise<Frame | null> {
-    const run = () => new Promise<Frame | null>((resolve) => {
-      const reqId = randomUUID();
-      const timer = setTimeout(() => {
-        if (this.lookPending?.reqId === reqId) { this.lookPending = null; this.awaitingLookFrame = false; resolve(null); }
-      }, 4000);
-      this.lookPending = { reqId, resolve: (f) => { clearTimeout(timer); resolve(f); } };
-      this.awaitingLookFrame = false;
-      this.send({ t: "need_frame", reqId });
-    });
-    const p = this.frameChain.then(run, run);
-    this.frameChain = p.catch(() => {});
-    return p;
+    return this.host.requestFrame();
   }
 
   // ── send / teardown ───────────────────────────────────────────────────────
@@ -751,12 +575,7 @@ export class LiveSession {
     liveSockets.delete(this.hear);
     this.warmAc?.abort();
     this.ac?.abort();
-    this.agentAc?.abort();
-    void this.agent?.dispose();
-    void this.mcp?.then((m) => m.close()).catch(() => {});
-    for (const settle of [...this.permPending.values()]) settle("deny", "cancelled");
-    this.cancelPendingElicitations();
-    this.lookPending?.resolve(null);
+    this.host.dispose();
     for (const r of this.bridgePending.values()) r("The session ended.");
     this.bridgePending.clear();
     try { this.ws.close(); } catch { /* already closing */ }
