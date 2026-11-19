@@ -4,6 +4,7 @@ import { WebSocketServer } from "ws";
 import { languageSchema } from "@openlive/shared";
 import { LiveSession } from "./session.js";
 import { FlowLiveSession } from "./flow-ws.js";
+import { RealtimeSession } from "./realtime-session.js";
 import { upgradeAsrStream } from "../voice/native.js";
 
 // Constant-time equality that also hides length differences.
@@ -41,7 +42,7 @@ export function attachLiveWs(server: Server): WebSocketServer {
   server.on("upgrade", (req, socket, head) => {
     let url: URL;
     try { url = new URL(req.url ?? "", "http://localhost"); } catch { socket.destroy(); return; }
-    if (url.pathname !== "/live" && url.pathname !== "/voice/stream") { socket.destroy(); return; }
+    if (url.pathname !== "/live" && url.pathname !== "/realtime" && url.pathname !== "/voice/stream") { socket.destroy(); return; }
     // Two trusted callers: the web proxy (holds the secret, sends the header)
     // and the desktop renderer (browser WebSocket can't set headers → ?token=).
     if (AGENT_SECRET
@@ -56,6 +57,17 @@ export function attachLiveWs(server: Server): WebSocketServer {
       return reject(socket, "403 Forbidden", `origin ${req.headers.origin} is not this machine`);
     }
     if (url.pathname === "/voice/stream") { upgradeAsrStream(req, socket, head, url.searchParams.get("engine"), url.searchParams.get("lang")); return; }
+    // The native-audio call: same gate, same server, its own session. Binary PCM in and out
+    // instead of the text protocol /live speaks, and the coding agent driven through the same
+    // AcpHost — a pathname check plus a branch, not a second auth story.
+    if (url.pathname === "/realtime") {
+      const rtChat = url.searchParams.get("chat") ?? "";
+      console.log(`[agent] /realtime upgrade accepted — chat=${rtChat || "(none)"}`);
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        void new RealtimeSession(ws, rtChat, languageSchema.safeParse(url.searchParams.get("lang")).data, url.searchParams.get("device") === "1").start();
+      });
+      return;
+    }
     const chatId = url.searchParams.get("chat") ?? "";
     // Flow's orb runtime lives in its own renderer, so it opens its own
     // connection to this same endpoint. Same schemas, same permission protocol,
