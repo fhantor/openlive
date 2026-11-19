@@ -16,3 +16,4 @@ export * from "./capabilities";
 export * from "./reminders";
 export * from "./edits";
 export * from "./tool-summary";
+export * from "./realtime-protocol";

@@ -6,6 +6,8 @@
 // Pure serializable data: NO node imports (the browser bundles this). Node-only
 // helpers (credential probing, PATH widening, terminal launch) live in ./node.
 
+import type { SteeringCapability } from "./realtime-protocol";
+
 export const AGENT_IDS = ["claude-code", "codex", "cursor", "opencode", "hermes", "gemini", "copilot", "kiro", "pi"] as const;
 export type AgentId = (typeof AGENT_IDS)[number];
 
@@ -93,6 +95,12 @@ export interface AgentDef {
      *  `--policy <file>`. An agent without one keeps its tools with every ask
      *  refused. Claude's goes through `_meta.claudeCode.options` instead. */
     toolless?: { args?: string[]; env?: Record<string, string>; policyToml?: string };
+    /** How a mid-task correction reaches this agent without destroying completed
+     *  work. Measured per agent in the Stage 0 probe (judged on disk state, not on
+     *  what the agent says) — see scripts/probes/probe-acp-steer.mjs. Absent means
+     *  "cancel_resume", the documented safe default: ACP has no standard steering,
+     *  and boundary-cancel at worst loses the in-flight step. */
+    steering?: SteeringCapability;
   };
 }
 
@@ -275,7 +283,7 @@ export const AGENT_REGISTRY: Record<AgentId, AgentDef> = {
         { kind: "json", path: "~/.hermes/auth.json", rule: { hasKey: "providers" } },
       ],
     },
-    acp: { resumeAcrossRestart: true, preamble: "firstMessage", mcp: "passthrough", terminal: true },
+    acp: { resumeAcrossRestart: true, preamble: "firstMessage", mcp: "passthrough", terminal: true, steering: "mcp_guidance" },
     startHint: "Hermes has no model provider selected. Run `hermes setup` (the Finish setup button in Settings → Agents) and pick a provider.",
   },
   "gemini": {
