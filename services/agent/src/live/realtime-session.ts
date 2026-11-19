@@ -292,8 +292,11 @@ export class RealtimeSession {
     // clipboard or device port to serve here: the hosted MCP server publishes only the tools below.
     this.toolSession = { workspace: () => this.host.cwd };
     this.approve = allowAll;
-    this.tools = this.buildTools();
+    // Before buildTools(): its providers may read `workspace()`, which reads the
+    // host. Same ordering trap that crashed /live (see session.ts) — the closure
+    // above is lazy, but a provider is not obliged to be.
     this.host = deps.host ?? new AcpHost(this.ports());
+    this.tools = this.buildTools();
 
     ws.on("message", (data: Buffer, isBinary: boolean) => {
       try {
